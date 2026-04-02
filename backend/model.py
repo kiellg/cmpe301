@@ -84,28 +84,56 @@ class MesManager:
                 """
                 CREATE TABLE IF NOT EXISTS process_data (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    order_id TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    tag_name TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    station TEXT NOT NULL
+                    order_id INTEGER NOT NULL,
+                    station_id INTEGER,
+                    actual_start TEXT,
+                    actual_end TEXT,
+                    good_units INTEGER DEFAULT 1,
+                    defect_count INTEGER DEFAULT 0
                 )
                 """
             )
-            # Migrate existing production_orders tables that predate the priority/rfid_tag columns
-            existing_columns = {
-                row[1]
-                for row in connection.execute("PRAGMA table_info(production_orders)")
-            }
-            if "priority" not in existing_columns:
+
+            # ── production_orders migrations ──────────────────────────────────
+            po_cols = self._table_columns(connection, "production_orders")
+            if "priority" not in po_cols:
                 cursor.execute(
                     "ALTER TABLE production_orders ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
                 )
-            if "rfid_tag" not in existing_columns:
+            if "rfid_tag" not in po_cols:
                 cursor.execute(
                     "ALTER TABLE production_orders ADD COLUMN rfid_tag TEXT"
                 )
+
+            # ── process_data migrations ───────────────────────────────────────
+            # Adds the columns needed by the new log_process_data signature.
+            # Existing rows keep NULL for new columns; NOT NULL is not required
+            # for added columns in SQLite ALTER TABLE.
+            pd_cols = self._table_columns(connection, "process_data")
+            if "actual_start" not in pd_cols:
+                cursor.execute(
+                    "ALTER TABLE process_data ADD COLUMN actual_start TEXT"
+                )
+            if "actual_end" not in pd_cols:
+                cursor.execute(
+                    "ALTER TABLE process_data ADD COLUMN actual_end TEXT"
+                )
+            if "good_units" not in pd_cols:
+                cursor.execute(
+                    "ALTER TABLE process_data ADD COLUMN good_units INTEGER DEFAULT 1"
+                )
+            if "defect_count" not in pd_cols:
+                cursor.execute(
+                    "ALTER TABLE process_data ADD COLUMN defect_count INTEGER DEFAULT 0"
+                )
+            if "station_id" not in pd_cols:
+                cursor.execute(
+                    "ALTER TABLE process_data ADD COLUMN station_id INTEGER"
+                )
+
             connection.commit()
+
+    # ── user management ───────────────────────────────────────────────────────
 
     def get_user_by_username(self, username: str) -> User | None:
         normalized_username = username.strip()
@@ -214,6 +242,8 @@ class MesManager:
 
         self.last_error = ""
         return self.get_user_by_username(normalized_username)
+
+    # ── station management ────────────────────────────────────────────────────
 
     def list_stations(self) -> list[Station]:
         with self._connect() as connection:
@@ -324,6 +354,8 @@ class MesManager:
         self.last_error = ""
         return True
 
+    # ── production order management ───────────────────────────────────────────
+
     def add_order(
         self,
         order_id: str,
@@ -397,58 +429,123 @@ class MesManager:
         self.last_error = ""
         return [self._row_to_order(row) for row in rows]
 
-    def update_order_status(self, order_id: str, status: str) -> bool:
+    def update_order_status(self, order_pk: int, status: str) -> bool:
+        """
+        Update the status of a production order by its integer primary key.
+
+        :param order_pk: The production_orders.id (integer PK), as returned by
+                         list_orders() as ProductionOrder.id and encoded into
+                         the RFID tag by plc_client.encode_rfid().
+        :param status:   New status string: "Pending", "In Progress",
+                         "Completed", or "Failed".
+        """
         with self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE production_orders SET status = ? WHERE order_id = ?",
-                (status, order_id),
+                "UPDATE production_orders SET status = ? WHERE id = ?",
+                (status, order_pk),
             )
             connection.commit()
 
         if cursor.rowcount == 0:
-            self.last_error = "Order not found."
+            self.last_error = f"Order with id={order_pk} not found."
             return False
 
         self.last_error = ""
         return True
 
+    # ── process data logging ──────────────────────────────────────────────────
+
     def log_process_data(
         self,
-        order_id: str,
-        tag_name: str,
-        value: str,
-        station: str,
-    ) -> bool:
-        timestamp = datetime.now(timezone.utc).isoformat()
+        order_id: int,
+        station_id: int,
+        actual_start: str,
+        actual_end: str,
+        good_units: int,
+        defect_count: int,
+    ) -> None:
+        """
+        Record the result of a completed drilling cycle.
+
+        :param order_id:     production_orders.id (integer PK).
+        :param station_id:   stations.id of the station that ran the job.
+        :param actual_start: ISO-format UTC timestamp when drilling began.
+        :param actual_end:   ISO-format UTC timestamp when drilling finished.
+        :param good_units:   Number of units produced without defects.
+        :param defect_count: Number of defective units in this cycle.
+
+        TODO (D1 — quality tracking): good_units and defect_count are currently
+        hardcoded to 1 and 0 in the controller.  When defect entry is added to
+        the GUI, pass actual counts here.
+        """
         with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO process_data (order_id, timestamp, tag_name, value, station)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (order_id, timestamp, tag_name, value, station),
-            )
+            process_data_columns = self._table_columns(connection, "process_data")
+            if {"timestamp", "tag_name", "value", "station"}.issubset(process_data_columns):
+                connection.execute(
+                    """
+                    INSERT INTO process_data
+                        (order_id, timestamp, tag_name, value, station,
+                         actual_start, actual_end, good_units, defect_count, station_id)
+                    VALUES (?, ?, '', '', '', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        order_id,
+                        datetime.now(timezone.utc).isoformat(),
+                        actual_start,
+                        actual_end,
+                        good_units,
+                        defect_count,
+                        station_id,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO process_data
+                        (order_id, station_id, actual_start, actual_end, good_units, defect_count)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        order_id,
+                        station_id,
+                        actual_start,
+                        actual_end,
+                        good_units,
+                        defect_count,
+                    ),
+                )
             connection.commit()
 
         self.last_error = ""
-        return True
 
     def list_process_data(self, order_id: str | None = None) -> list[dict]:
-        sql = """
-            SELECT id, order_id, timestamp, tag_name, value, station
-            FROM process_data
-        """
-        parameters: tuple[object, ...] = ()
-        if order_id is not None:
-            sql += " WHERE order_id = ?"
-            parameters = (order_id,)
-        sql += " ORDER BY timestamp DESC"
-
         with self._connect() as connection:
+            process_data_columns = self._table_columns(connection, "process_data")
+            select_columns = [
+                column
+                for column in [
+                    "id",
+                    "order_id",
+                    "station_id",
+                    "actual_start",
+                    "actual_end",
+                    "good_units",
+                    "defect_count",
+                ]
+                if column in process_data_columns
+            ]
+            sql = f"SELECT {', '.join(select_columns)} FROM process_data"
+            parameters: tuple[object, ...] = ()
+            if order_id is not None:
+                sql += " WHERE order_id = ?"
+                parameters = (order_id,)
+            sql += " ORDER BY id DESC"
             rows = connection.execute(sql, parameters).fetchall()
 
         self.last_error = ""
         return [dict(row) for row in rows]
+
+    # ── display helpers ───────────────────────────────────────────────────────
 
     def get_logged_in_user_display(self, username: str) -> str:
         normalized_username = username.strip()
@@ -456,10 +553,16 @@ class MesManager:
             return "Logged in as: Guest"
         return f"Logged in as: {normalized_username}"
 
+    # ── private ───────────────────────────────────────────────────────────────
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
         return connection
+
+    @staticmethod
+    def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+        return {row["name"] for row in connection.execute(f"PRAGMA table_info({table_name})")}
 
     def _username_exists(self, username: str) -> bool:
         with self._connect() as connection:

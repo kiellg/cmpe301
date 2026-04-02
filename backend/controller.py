@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import sys
+from datetime import datetime, timezone
+
 from model import MesManager
+from plc_client import RECIPE_TASK_CODES, PlcClient
 from view import MesView
 
 
+_DRILL_STATION_ID = 3
+
+
 class MesController:
-    def __init__(self, model: MesManager, view: MesView) -> None:
+    def __init__(self, model: MesManager, view: MesView, plc_client: PlcClient) -> None:
         self.model = model
         self.view = view
+        self.plc_client = plc_client
         self.current_username: str | None = None
+        self._active_order: dict | None = None
+
         self._connect_signals()
 
     def _connect_signals(self) -> None:
@@ -25,6 +35,8 @@ class MesController:
         self.view.station_edit_requested.connect(self.handle_update_station)
         self.view.station_delete_requested.connect(self.handle_delete_station)
         self.view.order_submit_requested.connect(self.handle_order_submit)
+        self.view.plc_reconnect_requested.connect(self.plc_client.start_client)
+        self.view.plc_manual_write.connect(self.plc_client.write_node)
 
     def handle_login(self, username: str, password: str) -> None:
         user = self.model.verify_credentials(username, password)
@@ -132,6 +144,99 @@ class MesController:
         self._refresh_orders()
         self.view.clear_order_form()
         self.view.show_message("Order Submitted", f"Order {order.order_id} was saved.")
+
+    def handle_rfid_tag_read(self, payload: dict) -> None:
+        order_id = payload["order_id"]
+        orders = self.model.list_orders()
+        order = next(
+            (
+                row
+                for row in orders
+                if int(row.id) == order_id and row.status == "Pending"
+            ),
+            None,
+        )
+        if order is None:
+            self.view.append_plc_log(
+                f"WARNING: tag order #{order_id} has no matching Pending order in DB"
+            )
+            return
+
+        task_code = RECIPE_TASK_CODES.get(order.recipe, 0)
+        self._active_order = {
+            "db_id": order_id,
+            "task_code": task_code,
+            "quantity": order.quantity,
+            "start": datetime.now(timezone.utc).isoformat(),
+        }
+        self.model.update_order_status(order_id, "In Progress")
+        self._refresh_orders()
+        self.view.update_machine_state(
+            f"Carrier arrived: order #{order_id} — {order.recipe}"
+        )
+        self.view.append_plc_log(
+            f"RFID matched: order #{order_id} ({order.recipe})"
+        )
+
+    def handle_await_app(self) -> None:
+        if self._active_order is None:
+            self.view.update_machine_state("Idle — no pending orders")
+            self.view.append_plc_log("awaitApp fired but no active order")
+            return
+
+        order_id = self._active_order["db_id"]
+        task_code = self._active_order["task_code"]
+        quantity = self._active_order["quantity"]
+        try:
+            self.plc_client.dispatch_order(order_id, task_code, quantity)
+            self.view.update_machine_state(
+                f"Dispatched order #{order_id} — drilling starting"
+            )
+            self.view.append_plc_log(
+                f"dispatch_order: id={order_id} task_code={task_code} qty={quantity}"
+            )
+        except Exception as e:
+            self.view.append_plc_log(f"ERROR dispatch_order: {e}")
+            self.view.update_machine_state(f"Dispatch failed: {e}")
+
+    def handle_app_done(self) -> None:
+        if self._active_order is None:
+            self.view.append_plc_log("appDone fired but no active order tracked")
+            return
+
+        try:
+            actual_end = datetime.now(timezone.utc).isoformat()
+            order_id = self._active_order["db_id"]
+            self.model.update_order_status(order_id, "Completed")
+            try:
+                self.model.log_process_data(
+                    order_id=order_id,
+                    station_id=_DRILL_STATION_ID,
+                    actual_start=self._active_order["start"],
+                    actual_end=actual_end,
+                    good_units=1,
+                    defect_count=0,
+                    # TODO D1: replace good_units/defect_count when quality tracking added
+                )
+            except Exception as e:
+                print(f"log_process_data error: {e}", file=sys.stderr)
+
+            self._refresh_orders()
+            self.view.update_machine_state("Completed — ready for next carrier")
+            self.view.append_plc_log(
+                f"Order #{order_id} completed at {actual_end}"
+            )
+        finally:
+            self._active_order = None
+
+    def handle_plc_error(self, message: str) -> None:
+        print(f"[PLC ERROR] {message}", file=sys.stderr)
+        self.view.append_plc_log(f"ERROR: {message}")
+        self.view.update_machine_state(f"PLC error: {message[:60]}")
+
+    def handle_plc_connected(self) -> None:
+        self.view.update_machine_state("PLC connected")
+        self.view.append_plc_log("Connected to PLC")
 
     def _refresh_stations(self) -> None:
         self.view.populate_stations(self.model.list_stations())

@@ -26,9 +26,10 @@ CREATE TABLE IF NOT EXISTS production_orders (
 
 CREATE TABLE IF NOT EXISTS process_data (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id TEXT NOT NULL,
-    timestamp TEXT NOT NULL,
-    tag_name TEXT NOT NULL,
-    value TEXT NOT NULL,
-    station TEXT NOT NULL
+    order_id INTEGER NOT NULL,
+    station_id INTEGER,
+    actual_start TEXT,
+    actual_end TEXT,
+    good_units INTEGER DEFAULT 1,
+    defect_count INTEGER DEFAULT 0
 );

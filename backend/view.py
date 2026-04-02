@@ -1,20 +1,155 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from PyQt5 import uic
-from PyQt5.QtCore import QObject, Qt, pyqtSignal
-from PyQt5.QtGui import QColor
+from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QFontDatabase, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QComboBox,
     QDialog,
+    QFormLayout,
+    QGroupBox,
     QHeaderView,
+    QHBoxLayout,
+    QLabel,
     QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSpinBox,
+    QTableWidget,
     QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
 
 from model import ProductionOrder, Station
+from plc_client import encode_rfid, RECIPE_TASK_CODES
+
+
+class WriteTagDialog(QDialog):
+    def __init__(self, view: "MesView") -> None:
+        super().__init__(view.main_window)
+        self._view = view
+        self._waiting_for_write = False
+        self._tick_count = 0
+        self._signal_connected = True
+        self._pending_order_id = 0
+        self._pending_recipe = ""
+
+        self.setModal(True)
+        self.setWindowTitle("Write RFID Tag")
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(100)
+        self._timer.timeout.connect(self._handle_timeout_tick)
+
+        self._order_id_spin = QSpinBox(self)
+        self._order_id_spin.setRange(1, 9999)
+
+        self._recipe_combo = QComboBox(self)
+        self._recipe_combo.addItems(list(RECIPE_TASK_CODES.keys()))
+
+        self._quantity_spin = QSpinBox(self)
+        self._quantity_spin.setRange(1, 100)
+
+        self._write_button = QPushButton("Write", self)
+        self._cancel_button = QPushButton("Cancel", self)
+
+        form_layout = QFormLayout()
+        form_layout.addRow("Order ID", self._order_id_spin)
+        form_layout.addRow("Recipe", self._recipe_combo)
+        form_layout.addRow("Quantity", self._quantity_spin)
+
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addStretch()
+        buttons_layout.addWidget(self._write_button)
+        buttons_layout.addWidget(self._cancel_button)
+
+        root_layout = QVBoxLayout(self)
+        root_layout.addLayout(form_layout)
+        root_layout.addLayout(buttons_layout)
+
+        self._write_button.clicked.connect(self._start_write)
+        self._cancel_button.clicked.connect(self.reject)
+        self._view.plc_data_changed.connect(self._handle_plc_data_changed)
+
+    def _start_write(self) -> None:
+        order_id = int(self._order_id_spin.value())
+        recipe = self._recipe_combo.currentText()
+        quantity = int(self._quantity_spin.value())
+        task_code = RECIPE_TASK_CODES[recipe]
+        encoded = encode_rfid(order_id, task_code, quantity)
+
+        self._pending_order_id = order_id
+        self._pending_recipe = recipe
+        self._waiting_for_write = True
+        self._tick_count = 0
+
+        self._write_button.setText("Writing...")
+        self._write_button.setEnabled(False)
+        self._cancel_button.setEnabled(False)
+
+        self._view.plc_manual_write.emit("writeData", encoded)
+        self._view.plc_manual_write.emit("doWrite", True)
+        self._timer.start()
+
+    def _handle_plc_data_changed(self, alias: str, value: object) -> None:
+        if not self._waiting_for_write:
+            return
+        if alias != "writeDone" or not bool(value):
+            return
+
+        self._waiting_for_write = False
+        self._timer.stop()
+        self._view.plc_manual_write.emit("doWrite", False)
+        self._view.append_plc_log(
+            f"Tag written: order #{self._pending_order_id} ({self._pending_recipe})"
+        )
+        self.accept()
+
+    def _handle_timeout_tick(self) -> None:
+        if not self._waiting_for_write:
+            return
+
+        self._tick_count += 1
+        if self._tick_count < 50:
+            return
+
+        self._waiting_for_write = False
+        self._timer.stop()
+        self._view.append_plc_log("ERROR: writeDone timeout — is carrier at stopper?")
+        self._view.plc_manual_write.emit("doWrite", False)
+        self.reject()
+
+    def reject(self) -> None:
+        if self._waiting_for_write:
+            return
+        super().reject()
+
+    def closeEvent(self, event) -> None:  # noqa: ANN001
+        if self._waiting_for_write:
+            event.ignore()
+            return
+        self._disconnect_signal()
+        super().closeEvent(event)
+
+    def done(self, result: int) -> None:
+        self._timer.stop()
+        self._disconnect_signal()
+        super().done(result)
+
+    def _disconnect_signal(self) -> None:
+        if not self._signal_connected:
+            return
+        try:
+            self._view.plc_data_changed.disconnect(self._handle_plc_data_changed)
+        except TypeError:
+            pass
+        self._signal_connected = False
 
 
 class MesView(QObject):
@@ -31,17 +166,29 @@ class MesView(QObject):
     station_edit_requested = pyqtSignal(int, str, str, str, bool)
     station_delete_requested = pyqtSignal(int)
     order_submit_requested = pyqtSignal(str, str, int, int)
+    plc_reconnect_requested = pyqtSignal()
+    plc_manual_write = pyqtSignal(str, object)
+    plc_data_changed = pyqtSignal(str, object)
 
     def __init__(self) -> None:
         super().__init__()
         self.ui_dir = Path(__file__).resolve().parent
         self.station_dialog: QDialog | None = None
+        self._node_rows: dict[str, int] = {}
+        self._plc_buttons: list[QPushButton] = []
 
         self.login_window = self._load_ui("login_window.ui")
         self.register_window = self._load_ui("register_window.ui")
         self.password_dialog = self._load_ui("password_dialog.ui")
         self.station_editor = self._load_ui("station_editor.ui")
         self.main_window = self._load_ui("mes_window.ui")
+
+        self._plc_dot: QLabel | None = None
+        self._plc_status_label: QLabel | None = None
+        self._plc_connection_state_label: QLabel | None = None
+        self._plc_machine_state_label: QLabel | None = None
+        self._node_table: QTableWidget | None = None
+        self._plc_log: QPlainTextEdit | None = None
 
         self._configure_widgets()
         self._connect_signals()
@@ -116,8 +263,8 @@ class MesView(QObject):
         table.setRowCount(len(orders))
         status_colours = {
             "In Progress": QColor(255, 255, 200),
-            "Completed":   QColor(200, 255, 200),
-            "Failed":      QColor(255, 200, 200),
+            "Completed": QColor(200, 255, 200),
+            "Failed": QColor(255, 200, 200),
         }
         for row_index, order in enumerate(orders):
             row_colour = status_colours.get(order.status)
@@ -150,6 +297,64 @@ class MesView(QObject):
 
     def show_error(self, title: str, message: str) -> None:
         QMessageBox.warning(self._message_parent(), title, message)
+
+    def update_machine_state(self, text: str) -> None:
+        machine_state_text = f"Machine State: {text}"
+        self.main_window.machine_state_label.setText(machine_state_text)
+        if self._plc_machine_state_label is not None:
+            self._plc_machine_state_label.setText(machine_state_text)
+
+    def update_oee(self, availability: float, performance: float, quality: float) -> None:
+        oee = availability * performance * quality
+        self.main_window.oee_label.setText(
+            f"OEE: {oee:.1%}  |  "
+            f"A: {availability:.1%}  "
+            f"P: {performance:.1%}  "
+            f"Q: {quality:.1%}"
+        )
+
+    def update_node_monitor(self, alias: str, value: object) -> None:
+        if alias in self._node_rows and self._node_table is not None:
+            row = self._node_rows[alias]
+            display = value
+            if alias == "readData" and isinstance(value, (list, tuple, bytes, bytearray)):
+                display = " ".join(f"{int(byte):02X}" for byte in list(value)[:12])
+            self._node_table.setItem(row, 2, QTableWidgetItem(str(display)))
+            self._node_table.setItem(
+                row,
+                3,
+                QTableWidgetItem(datetime.now().strftime("%H:%M:%S")),
+            )
+        self.plc_data_changed.emit(alias, value)
+
+    def update_plc_status(self, connected: bool) -> None:
+        if self._plc_dot is None or self._plc_status_label is None:
+            return
+
+        color = "#2ecc71" if connected else "#e74c3c"
+        state = "Connected" if connected else "Disconnected"
+        self._plc_dot.setStyleSheet(f"color: {color}; font-size: 16px;")
+        self._plc_status_label.setText(f"Status: {state}")
+        if self._plc_connection_state_label is not None:
+            self._plc_connection_state_label.setText(f"PLC Connection: {state}")
+        for button in self._plc_buttons:
+            button.setEnabled(connected)
+
+    def append_plc_log(self, message: str) -> None:
+        if self._plc_log is None:
+            return
+
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self._plc_log.appendPlainText(f"[{timestamp}] {message}")
+        while self._plc_log.document().lineCount() > 200:
+            cursor = self._plc_log.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            cursor.select(QTextCursor.BlockUnderCursor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()
+        self._plc_log.verticalScrollBar().setValue(
+            self._plc_log.verticalScrollBar().maximum()
+        )
 
     def _connect_signals(self) -> None:
         self.login_window.login_btn.clicked.connect(self._emit_login_requested)
@@ -204,6 +409,110 @@ class MesView(QObject):
             self.main_window.recipe_combo.addItems(
                 ["No Holes", "Left Holes", "Right Holes", "All Holes"]
             )
+
+        self._build_plc_diagnostics_tab()
+        self.update_machine_state("Not connected")
+        self.update_plc_status(False)
+
+    def _build_plc_diagnostics_tab(self) -> None:
+        plc_tab = QWidget(self.main_window)
+        plc_layout = QVBoxLayout(plc_tab)
+
+        status_layout = QHBoxLayout()
+        self._plc_dot = QLabel("●", plc_tab)
+        self._plc_status_label = QLabel("Status: Disconnected", plc_tab)
+        reconnect_button = QPushButton("Reconnect", plc_tab)
+        reconnect_button.clicked.connect(self.plc_reconnect_requested.emit)
+        status_layout.addWidget(self._plc_dot)
+        status_layout.addWidget(self._plc_status_label)
+        status_layout.addWidget(reconnect_button)
+        status_layout.addStretch()
+        plc_layout.addLayout(status_layout)
+
+        self._node_table = QTableWidget(plc_tab)
+        self._node_table.setColumnCount(4)
+        self._node_table.setHorizontalHeaderLabels(
+            ["Node Alias", "DB", "Value", "Last Updated"]
+        )
+        self._configure_table(self._node_table)
+        rows = [
+            ("appRun", "DB1"),
+            ("appDone", "DB1"),
+            ("awaitApp", "DB1"),
+            ("drillDone", "DB1"),
+            ("taskCode", "DB1"),
+            ("doRead", "DB3"),
+            ("readDone", "DB3"),
+            ("readPresence", "DB3"),
+            ("doWrite", "DB3"),
+            ("writeDone", "DB3"),
+            ("readData", "DB2"),
+        ]
+        self._node_table.setRowCount(len(rows))
+        for row_index, (alias, db_name) in enumerate(rows):
+            self._node_rows[alias] = row_index
+            self._node_table.setItem(row_index, 0, QTableWidgetItem(alias))
+            self._node_table.setItem(row_index, 1, QTableWidgetItem(db_name))
+            self._node_table.setItem(row_index, 2, QTableWidgetItem("--"))
+            self._node_table.setItem(row_index, 3, QTableWidgetItem("--"))
+        plc_layout.addWidget(self._node_table)
+
+        controls_layout = QHBoxLayout()
+
+        manual_group = QGroupBox("Manual PLC Controls", plc_tab)
+        manual_layout = QVBoxLayout(manual_group)
+        write_tag_button = QPushButton("Write Tag", manual_group)
+        read_tag_button = QPushButton("Read RFID Tag", manual_group)
+        reset_app_run_button = QPushButton("Reset appRun", manual_group)
+        reset_app_done_button = QPushButton("Reset appDone", manual_group)
+        write_tag_button.clicked.connect(self._open_write_tag_dialog)
+        read_tag_button.clicked.connect(self._trigger_manual_rfid_read)
+        reset_app_run_button.clicked.connect(
+            lambda: self.plc_manual_write.emit("appRun", False)
+        )
+        reset_app_done_button.clicked.connect(
+            lambda: self.plc_manual_write.emit("appDone", False)
+        )
+        for button in [
+            write_tag_button,
+            read_tag_button,
+            reset_app_run_button,
+            reset_app_done_button,
+        ]:
+            self._plc_buttons.append(button)
+            manual_layout.addWidget(button)
+        manual_layout.addStretch()
+
+        status_group = QGroupBox("PLC Status", plc_tab)
+        status_group_layout = QVBoxLayout(status_group)
+        self._plc_machine_state_label = QLabel("Machine State: Not connected", status_group)
+        self._plc_machine_state_label.setWordWrap(True)
+        self._plc_connection_state_label = QLabel(
+            "PLC Connection: Disconnected",
+            status_group,
+        )
+        status_group_layout.addWidget(self._plc_machine_state_label)
+        status_group_layout.addWidget(self._plc_connection_state_label)
+        status_group_layout.addStretch()
+
+        controls_layout.addWidget(manual_group)
+        controls_layout.addWidget(status_group)
+        plc_layout.addLayout(controls_layout)
+
+        self._plc_log = QPlainTextEdit(plc_tab)
+        self._plc_log.setReadOnly(True)
+        self._plc_log.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self._plc_log.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        plc_layout.addWidget(self._plc_log)
+
+        self.main_window.main_tabs.addTab(plc_tab, "PLC Diagnostics")
+
+    def _trigger_manual_rfid_read(self) -> None:
+        self.plc_manual_write.emit("doRead", True)
+        self.append_plc_log("Manual RFID read triggered")
+
+    def _open_write_tag_dialog(self) -> None:
+        WriteTagDialog(self).exec_()
 
     def _configure_table(self, table) -> None:
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
