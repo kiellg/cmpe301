@@ -1,0 +1,107 @@
+from opcua import Client, ua
+import time
+
+
+PLC_URL = "opc.tcp://172.21.3.1:4840"
+SIEMENS_URI = "http://www.siemens.com/simatic-s7-opcua"
+
+
+class SubHandler:
+    def datachange_notification(self, node, val, data):
+        print(f"Data change event at {node}. New value = {val}")
+
+
+if __name__ == "__main__":
+    client = Client(PLC_URL)
+    sub = None
+
+    try:
+        client.connect()
+        print(f"Connected to {PLC_URL}")
+
+        # Get namespace index using Siemens URI
+        idx = client.get_namespace_index(SIEMENS_URI)
+        print(f"Namespace index: {idx}")
+
+        def n(s):
+            return client.get_node(f'ns={idx}; s={s}')
+
+        # All nodes in one dictionary
+        nodes = {
+            # Demo variables from file 1
+            "var1": n('"OPCUA_data"."var1"'),
+            "var2": n('"OPCUA_data"."var2"'),
+            "var3": n('"OPCUA_data"."var3"'),
+
+            # RFID / application control variables from file 2
+            "run_application_flag": n('"OPCUA_data"."run_application_flag"'),
+            "application_finish_flag": n('"OPCUA_data"."application_finish"'),
+            "rfid_read_done": n('"RFID_control"."read_done"'),
+            "rfid_write_done": n('"RFID_control"."write_done"'),
+            "rfid_read": n('"RFID_control"."read"'),
+            "rfid_write": n('"RFID_control"."write"'),
+            "rfid_read_data": n('"identData"."readData"'),
+            "rfid_write_data": n('"identData"."writeData"'),
+        }
+
+        def set_value(name, value):
+            node = nodes.get(name)
+            if node is None:
+                print(f"Node '{name}' not found")
+                return
+
+            variant_type = node.get_data_type_as_variant_type()
+            node.set_value(ua.DataValue(ua.Variant(value, variant_type)))
+
+        def get_value(name):
+            node = nodes.get(name)
+            if node is None:
+                print(f"Node '{name}' not found")
+                return None
+            return node.get_value()
+
+        # Subscription from file 1
+        handler = SubHandler()
+        sub = client.create_subscription(500, handler)
+        sub.subscribe_data_change(nodes["var1"])
+        sub.subscribe_data_change(nodes["var2"])
+        sub.subscribe_data_change(nodes["var3"])
+
+        # Optional: write initial value to var3 like file 1
+        set_value("var3", [1, 2, 3, 4, 5, 6, 7, 8])
+
+        # Initialize flags from file 2
+        set_value("run_application_flag", False)
+        set_value("application_finish_flag", False)
+
+        def wait_for_rfid():
+            read_done = get_value("rfid_read_done")
+            if read_done:
+                set_value("run_application_flag", True)
+                set_value("rfid_write", False)
+                set_value("rfid_read_done", False)
+
+                rfid_data = get_value("rfid_read_data")
+                print(f"RFID read data: {rfid_data}")
+
+        def wait_for_finish():
+            finish = get_value("application_finish_flag")
+            if finish:
+                print("Application finished, resetting flags")
+                set_value("run_application_flag", False)
+                set_value("application_finish_flag", False)
+
+        print("Running main loop...")
+        while True:
+            wait_for_rfid()
+            wait_for_finish()
+            time.sleep(0.1)
+
+    except KeyboardInterrupt:
+        print("Stopped by user")
+
+    finally:
+        if sub is not None:
+            sub.delete()
+        client.disconnect()
+        print("Disconnected from PLC")
