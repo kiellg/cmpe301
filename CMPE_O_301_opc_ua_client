@@ -1,7 +1,6 @@
 from opcua import Client, ua
 import time
 
-
 PLC_URL = "opc.tcp://172.21.3.1:4840"
 SIEMENS_URI = "http://www.siemens.com/simatic-s7-opcua"
 
@@ -19,29 +18,38 @@ if __name__ == "__main__":
         client.connect()
         print(f"Connected to {PLC_URL}")
 
-        # Get namespace index using Siemens URI
         idx = client.get_namespace_index(SIEMENS_URI)
         print(f"Namespace index: {idx}")
 
         def n(s):
-            return client.get_node(f'ns={idx}; s={s}')
+            return client.get_node(f'ns={idx};s={s}')
 
-        # All nodes in one dictionary
         nodes = {
-            # Demo variables from file 1
+            # Demo variables (must exist as OPCUA_data DB on PLC)
             "var1": n('"OPCUA_data"."var1"'),
             "var2": n('"OPCUA_data"."var2"'),
             "var3": n('"OPCUA_data"."var3"'),
 
-            # RFID / application control variables from file 2
-            "run_application_flag": n('"OPCUA_data"."run_application_flag"'),
-            "application_finish_flag": n('"OPCUA_data"."application_finish"'),
-            "rfid_read_done": n('"RFID_control"."read_done"'),
-            "rfid_write_done": n('"RFID_control"."write_done"'),
-            "rfid_read": n('"RFID_control"."read"'),
-            "rfid_write": n('"RFID_control"."write"'),
-            "rfid_read_data": n('"identData"."readData"'),
-            "rfid_write_data": n('"identData"."writeData"'),
+            # abstractMachine [DB1] — matches screenshot exactly
+            "appRun":       n('"abstractMachine"."appRun"'),
+            "appDone":      n('"abstractMachine"."appDone"'),
+            "awaitApp":     n('"abstractMachine"."awaitApp"'),
+            "drillDone":    n('"abstractMachine"."drillDone"'),
+            "sendTCPcmd":   n('"abstractMachine"."sendTCPcmd"'),
+            "release":      n('"abstractMachine"."release"'),
+            "taskCode":     n('"abstractMachine"."taskCode"'),
+
+            # rfidControl [DB3] — matches screenshot exactly (camelCase)
+            "doRead":           n('"rfidControl"."doRead"'),
+            "readDone":         n('"rfidControl"."readDone"'),
+            "readPresence":     n('"rfidControl"."readPresence"'),
+            "doWrite":          n('"rfidControl"."doWrite"'),
+            "writeDone":        n('"rfidControl"."writeDone"'),
+            "writePresence":    n('"rfidControl"."writePresence"'),
+
+            # identData [DB2] — matches screenshot exactly
+            "readData":     n('"identData"."readData"'),
+            "writeData":    n('"identData"."writeData"'),
         }
 
         def set_value(name, value):
@@ -49,7 +57,6 @@ if __name__ == "__main__":
             if node is None:
                 print(f"Node '{name}' not found")
                 return
-
             variant_type = node.get_data_type_as_variant_type()
             node.set_value(ua.DataValue(ua.Variant(value, variant_type)))
 
@@ -60,36 +67,32 @@ if __name__ == "__main__":
                 return None
             return node.get_value()
 
-        # Subscription from file 1
+        # Subscription
         handler = SubHandler()
         sub = client.create_subscription(500, handler)
         sub.subscribe_data_change(nodes["var1"])
         sub.subscribe_data_change(nodes["var2"])
         sub.subscribe_data_change(nodes["var3"])
 
-        # Optional: write initial value to var3 like file 1
         set_value("var3", [1, 2, 3, 4, 5, 6, 7, 8])
 
-        # Initialize flags from file 2
-        set_value("run_application_flag", False)
-        set_value("application_finish_flag", False)
+        # Initialize control flags
+        set_value("appRun", False)
+        set_value("appDone", False)
 
         def wait_for_rfid():
-            read_done = get_value("rfid_read_done")
-            if read_done:
-                set_value("run_application_flag", True)
-                set_value("rfid_write", False)
-                set_value("rfid_read_done", False)
-
-                rfid_data = get_value("rfid_read_data")
-                print(f"RFID read data: {rfid_data}")
+            if get_value("readDone"):
+                rfid_data = get_value("readData")
+                print(f"RFID read complete. Data: {rfid_data}")
+                set_value("appRun", True)
+                set_value("doRead", False)
+                # readDone is reset by PLC on next cycle — do not reset here
 
         def wait_for_finish():
-            finish = get_value("application_finish_flag")
-            if finish:
-                print("Application finished, resetting flags")
-                set_value("run_application_flag", False)
-                set_value("application_finish_flag", False)
+            if get_value("appDone"):
+                print("Drilling complete, resetting flags")
+                set_value("appRun", False)
+                set_value("appDone", False)
 
         print("Running main loop...")
         while True:
