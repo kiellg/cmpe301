@@ -21,15 +21,25 @@ CREATE TABLE IF NOT EXISTS production_orders (
     created_by TEXT,
     created_at TEXT NOT NULL,
     priority INTEGER NOT NULL DEFAULT 0,
-    rfid_tag TEXT
+    rfid_tag TEXT,
+    updated_at TEXT,
+    last_result TEXT
 );
 
 CREATE TABLE IF NOT EXISTS process_data (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id INTEGER NOT NULL,
+    business_order_id TEXT,
     station_id INTEGER,
+    recipe TEXT,
+    rfid_tag TEXT,
     actual_start TEXT,
     actual_end TEXT,
+    final_status TEXT,
+    result_message TEXT,
+    fault_code TEXT,
+    cycle_complete INTEGER DEFAULT 0,
+    logged_at TEXT,
     good_units INTEGER DEFAULT 1,
     defect_count INTEGER DEFAULT 0
 );

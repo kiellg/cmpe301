@@ -5,13 +5,13 @@ import sys
 from PyQt5.QtWidgets import QApplication
 
 from controller import MesController
-from model import MesManager
+from model import DEFAULT_DB_PATH, MesManager
 from plc_client import PlcClient
 from view import MesView
 
 
 def create_app(
-    db_path: str = "mes.db",
+    db_path: str = str(DEFAULT_DB_PATH),
 ) -> tuple[QApplication, MesManager, MesView, MesController, PlcClient]:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("MES Access Manager")

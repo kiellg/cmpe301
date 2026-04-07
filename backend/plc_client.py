@@ -134,6 +134,17 @@ def encode_rfid(order_id: int, task_code: int, quantity: int) -> list[int]:
     return list(buf)
 
 
+def format_rfid_trace(order_id: int, task_code: int, quantity: int) -> str:
+    """
+    Human-readable summary of the RFID payload written to the carrier.
+
+    The current reduced-scope MES flow uses the production_orders.id integer as
+    the short-term execution key sent through the PLC/RFID path.  The business
+    order identifier remains stored separately in SQLite and shown in the UI.
+    """
+    return f"dbid={order_id};task={task_code};qty={quantity}"
+
+
 def decode_rfid(data: list[int]) -> dict[str, int]:
     """
     Deserialize a 32-byte RFID payload from identData.readData.
@@ -275,10 +286,15 @@ class PlcClient(QThread):
 
         # Public connection state (read from any thread; written only in worker)
         self._connected = False
+        self.last_error = ""
 
     # ------------------------------------------------------------------
     # Public API (called from the GUI thread)
     # ------------------------------------------------------------------
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
 
     def start_client(self) -> None:
         """
@@ -296,7 +312,7 @@ class PlcClient(QThread):
         self._stop_event.set()
         self.wait()  # blocks GUI thread until QThread.run() returns
 
-    def dispatch_order(self, order_id: int, task_code: int, quantity: int) -> None:
+    def dispatch_order(self, order_id: int, task_code: int, quantity: int) -> bool:
         """
         Send a production order to the PLC.  Must be called from the GUI thread
         in response to the await_app signal (PLC ready for a new job).
@@ -320,8 +336,9 @@ class PlcClient(QThread):
                 plc_client.dispatch_order(order.id, task_code, order.quantity)
         """
         if not self._connected:
-            self.error.emit("dispatch_order: PLC not connected — skipping")
-            return
+            self.last_error = "dispatch_order: PLC not connected — skipping"
+            self.error.emit(self.last_error)
+            return False
 
         with self._write_lock:
             try:
@@ -351,7 +368,8 @@ class PlcClient(QThread):
                 write_confirmed = False
                 while time.monotonic() < deadline:
                     if self._stop_event.is_set():
-                        return  # Application shutting down — abort gracefully
+                        self.last_error = "dispatch_order aborted during shutdown"
+                        return False
                     if self._read_bool("writeDone"):
                         write_confirmed = True
                         break
@@ -360,11 +378,12 @@ class PlcClient(QThread):
                 if not write_confirmed:
                     # Clean up doWrite before reporting failure
                     self._write_node("doWrite", False)
-                    self.error.emit(
+                    self.last_error = (
                         f"dispatch_order: writeDone timeout after {WRITE_TIMEOUT_S}s "
                         f"(order_id={order_id}). Check RFID tag at write station."
                     )
-                    return
+                    self.error.emit(self.last_error)
+                    return False
 
                 # Clear doWrite — PLC handshake expects this after writeDone
                 self._write_node("doWrite", False)
@@ -381,9 +400,13 @@ class PlcClient(QThread):
                     "(order_id=%d task_code=%d quantity=%d)",
                     order_id, task_code, quantity,
                 )
+                self.last_error = ""
+                return True
 
             except Exception as exc:  # noqa: BLE001
-                self.error.emit(f"dispatch_order failed: {exc}")
+                self.last_error = f"dispatch_order failed: {exc}"
+                self.error.emit(self.last_error)
+                return False
 
     def write_node(self, alias: str, value: object) -> None:
         """

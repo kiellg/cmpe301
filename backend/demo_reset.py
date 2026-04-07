@@ -4,10 +4,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from model import MesManager
+from model import DEFAULT_DB_PATH, MesManager
 
 
-db_path = os.path.join(os.path.dirname(__file__), "mes.db")
+db_path = str(DEFAULT_DB_PATH)
 mgr = MesManager(db_path)
 
 conn = sqlite3.connect(db_path)
@@ -51,15 +51,9 @@ print()
 print("DEMO STEPS:")
 print("  1. python backend/demo_reset.py")
 print("  2. python backend/mes_app.py")
-print("  3. log in, go to Orders tab - 3 Pending orders visible")
-print("  4. go to PLC Diagnostics tab")
-print("  5. make sure carrier is physically at the stopper")
-print("  6. click 'Write Tag' - enter order ID 1, recipe Left Holes, qty 1")
-print("  7. click Write - watch log: 'Tag written: order #1'")
-print("  8. click 'Read RFID Tag' - triggers fresh PLC read")
-print("  9. watch node monitor: readPresence=True, readDone=True")
-print(" 10. machine state: 'Carrier arrived: order #1 - Left Holes'")
-print(" 11. awaitApp fires - watch appRun=True, taskCode=1 in node monitor")
-print(" 12. watch the drill move physically")
-print(" 13. appDone=True - order #1 -> Completed in Orders tab")
-print(" 14. repeat for orders #2 and #3")
+print("  3. log in, go to New Order, and submit a drilling order")
+print("  4. if the PLC is ready, the order will move to In Progress automatically")
+print("  5. use PLC Diagnostics only if you want to observe or debug node activity")
+print("  6. watch appRun/taskCode/writeData in the node monitor")
+print("  7. when appDone=True arrives, the order should move to Completed")
+print("  8. check the Order History tab for RFID/result/last-update traceability")

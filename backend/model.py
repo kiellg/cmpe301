@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 
+DEFAULT_DB_PATH = Path(__file__).resolve().with_name("mes.db")
+
 
 @dataclass
 class User:
@@ -33,10 +35,12 @@ class ProductionOrder:
     created_at: str
     priority: int
     rfid_tag: str | None
+    updated_at: str | None
+    last_result: str | None
 
 
 class MesManager:
-    def __init__(self, db_path: str | Path = "mes.db") -> None:
+    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
         self.db_path = Path(db_path)
         self.last_error = ""
         self.initialize_database()
@@ -76,7 +80,9 @@ class MesManager:
                     created_by TEXT,
                     created_at TEXT NOT NULL,
                     priority INTEGER NOT NULL DEFAULT 0,
-                    rfid_tag TEXT
+                    rfid_tag TEXT,
+                    updated_at TEXT,
+                    last_result TEXT
                 )
                 """
             )
@@ -85,9 +91,17 @@ class MesManager:
                 CREATE TABLE IF NOT EXISTS process_data (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     order_id INTEGER NOT NULL,
+                    business_order_id TEXT,
                     station_id INTEGER,
+                    recipe TEXT,
+                    rfid_tag TEXT,
                     actual_start TEXT,
                     actual_end TEXT,
+                    final_status TEXT,
+                    result_message TEXT,
+                    fault_code TEXT,
+                    cycle_complete INTEGER DEFAULT 0,
+                    logged_at TEXT,
                     good_units INTEGER DEFAULT 1,
                     defect_count INTEGER DEFAULT 0
                 )
@@ -103,6 +117,14 @@ class MesManager:
             if "rfid_tag" not in po_cols:
                 cursor.execute(
                     "ALTER TABLE production_orders ADD COLUMN rfid_tag TEXT"
+                )
+            if "updated_at" not in po_cols:
+                cursor.execute(
+                    "ALTER TABLE production_orders ADD COLUMN updated_at TEXT"
+                )
+            if "last_result" not in po_cols:
+                cursor.execute(
+                    "ALTER TABLE production_orders ADD COLUMN last_result TEXT"
                 )
 
             # ── process_data migrations ───────────────────────────────────────
@@ -129,6 +151,38 @@ class MesManager:
             if "station_id" not in pd_cols:
                 cursor.execute(
                     "ALTER TABLE process_data ADD COLUMN station_id INTEGER"
+                )
+            if "business_order_id" not in pd_cols:
+                cursor.execute(
+                    "ALTER TABLE process_data ADD COLUMN business_order_id TEXT"
+                )
+            if "recipe" not in pd_cols:
+                cursor.execute(
+                    "ALTER TABLE process_data ADD COLUMN recipe TEXT"
+                )
+            if "rfid_tag" not in pd_cols:
+                cursor.execute(
+                    "ALTER TABLE process_data ADD COLUMN rfid_tag TEXT"
+                )
+            if "final_status" not in pd_cols:
+                cursor.execute(
+                    "ALTER TABLE process_data ADD COLUMN final_status TEXT"
+                )
+            if "result_message" not in pd_cols:
+                cursor.execute(
+                    "ALTER TABLE process_data ADD COLUMN result_message TEXT"
+                )
+            if "fault_code" not in pd_cols:
+                cursor.execute(
+                    "ALTER TABLE process_data ADD COLUMN fault_code TEXT"
+                )
+            if "cycle_complete" not in pd_cols:
+                cursor.execute(
+                    "ALTER TABLE process_data ADD COLUMN cycle_complete INTEGER DEFAULT 0"
+                )
+            if "logged_at" not in pd_cols:
+                cursor.execute(
+                    "ALTER TABLE process_data ADD COLUMN logged_at TEXT"
                 )
 
             connection.commit()
@@ -384,12 +438,24 @@ class MesManager:
             return None
 
         created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        updated_at = created_at
         with self._connect() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO production_orders
-                    (order_id, recipe, quantity, status, created_by, created_at, priority, rfid_tag)
-                VALUES (?, ?, ?, 'Pending', ?, ?, ?, ?)
+                    (
+                        order_id,
+                        recipe,
+                        quantity,
+                        status,
+                        created_by,
+                        created_at,
+                        priority,
+                        rfid_tag,
+                        updated_at,
+                        last_result
+                    )
+                VALUES (?, ?, ?, 'Pending', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     normalized_order_id,
@@ -399,13 +465,15 @@ class MesManager:
                     created_at,
                     int(priority),
                     rfid_tag,
+                    updated_at,
+                    "Saved in MES",
                 ),
             )
             connection.commit()
             row = connection.execute(
                 """
                 SELECT id, order_id, recipe, quantity, status, created_by, created_at,
-                       priority, rfid_tag
+                       priority, rfid_tag, updated_at, last_result
                 FROM production_orders
                 WHERE id = ?
                 """,
@@ -420,7 +488,7 @@ class MesManager:
             rows = connection.execute(
                 """
                 SELECT id, order_id, recipe, quantity, status, created_by, created_at,
-                       priority, rfid_tag
+                       priority, rfid_tag, updated_at, last_result
                 FROM production_orders
                 ORDER BY priority DESC, created_at DESC, id DESC
                 """
@@ -429,7 +497,34 @@ class MesManager:
         self.last_error = ""
         return [self._row_to_order(row) for row in rows]
 
-    def update_order_status(self, order_pk: int, status: str) -> bool:
+    def get_order_by_id(self, order_pk: int) -> ProductionOrder | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, order_id, recipe, quantity, status, created_by, created_at,
+                       priority, rfid_tag, updated_at, last_result
+                FROM production_orders
+                WHERE id = ?
+                """,
+                (order_pk,),
+            ).fetchone()
+
+        if row is None:
+            self.last_error = f"Order with id={order_pk} not found."
+            return None
+
+        self.last_error = ""
+        return self._row_to_order(row)
+
+    def update_order_status(
+        self,
+        order_pk: int,
+        status: str,
+        *,
+        rfid_tag: str | None = None,
+        last_result: str | None = None,
+        updated_at: str | None = None,
+    ) -> bool:
         """
         Update the status of a production order by its integer primary key.
 
@@ -439,86 +534,107 @@ class MesManager:
         :param status:   New status string: "Pending", "In Progress",
                          "Completed", or "Failed".
         """
-        with self._connect() as connection:
-            cursor = connection.execute(
-                "UPDATE production_orders SET status = ? WHERE id = ?",
-                (status, order_pk),
-            )
-            connection.commit()
+        fields: dict[str, object] = {
+            "status": status,
+            "updated_at": updated_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        if rfid_tag is not None:
+            fields["rfid_tag"] = rfid_tag
+        if last_result is not None:
+            fields["last_result"] = last_result
+        return self._update_order_fields(order_pk, fields)
 
-        if cursor.rowcount == 0:
-            self.last_error = f"Order with id={order_pk} not found."
-            return False
-
-        self.last_error = ""
-        return True
+    def update_order_traceability(
+        self,
+        order_pk: int,
+        *,
+        rfid_tag: str | None = None,
+        last_result: str | None = None,
+        updated_at: str | None = None,
+    ) -> bool:
+        fields: dict[str, object] = {}
+        if rfid_tag is not None:
+            fields["rfid_tag"] = rfid_tag
+        if last_result is not None:
+            fields["last_result"] = last_result
+        if not fields:
+            self.last_error = ""
+            return True
+        fields["updated_at"] = updated_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return self._update_order_fields(order_pk, fields)
 
     # ── process data logging ──────────────────────────────────────────────────
 
     def log_process_data(
         self,
         order_id: int,
-        station_id: int,
-        actual_start: str,
-        actual_end: str,
-        good_units: int,
-        defect_count: int,
+        business_order_id: str,
+        station_id: int | None,
+        recipe: str,
+        actual_start: str | None,
+        actual_end: str | None,
+        final_status: str,
+        *,
+        rfid_tag: str | None = None,
+        result_message: str | None = None,
+        fault_code: str | None = None,
+        cycle_complete: bool = False,
+        logged_at: str | None = None,
+        good_units: int = 0,
+        defect_count: int = 0,
     ) -> None:
         """
         Record the result of a completed drilling cycle.
 
         :param order_id:     production_orders.id (integer PK).
+        :param business_order_id:
+                            Human-readable order identifier entered in the MES.
         :param station_id:   stations.id of the station that ran the job.
+        :param recipe:       Human-readable drilling recipe / pattern.
         :param actual_start: ISO-format UTC timestamp when drilling began.
         :param actual_end:   ISO-format UTC timestamp when drilling finished.
-        :param good_units:   Number of units produced without defects.
-        :param defect_count: Number of defective units in this cycle.
-
-        TODO (D1 — quality tracking): good_units and defect_count are currently
-        hardcoded to 1 and 0 in the controller.  When defect entry is added to
-        the GUI, pass actual counts here.
+        :param final_status: Final MES status for this execution attempt.
         """
+        logged_at = logged_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
         with self._connect() as connection:
             process_data_columns = self._table_columns(connection, "process_data")
-            if {"timestamp", "tag_name", "value", "station"}.issubset(process_data_columns):
-                connection.execute(
-                    """
-                    INSERT INTO process_data
-                        (order_id, timestamp, tag_name, value, station,
-                         actual_start, actual_end, good_units, defect_count, station_id)
-                    VALUES (?, ?, '', '', '', ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        order_id,
-                        datetime.now(timezone.utc).isoformat(),
-                        actual_start,
-                        actual_end,
-                        good_units,
-                        defect_count,
-                        station_id,
-                    ),
-                )
-            else:
-                connection.execute(
-                    """
-                    INSERT INTO process_data
-                        (order_id, station_id, actual_start, actual_end, good_units, defect_count)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        order_id,
-                        station_id,
-                        actual_start,
-                        actual_end,
-                        good_units,
-                        defect_count,
-                    ),
-                )
+            insert_data: dict[str, object] = {
+                "order_id": order_id,
+                "business_order_id": business_order_id,
+                "station_id": station_id,
+                "recipe": recipe,
+                "rfid_tag": rfid_tag,
+                "actual_start": actual_start,
+                "actual_end": actual_end,
+                "final_status": final_status,
+                "result_message": result_message,
+                "fault_code": fault_code,
+                "cycle_complete": int(bool(cycle_complete)),
+                "logged_at": logged_at,
+                "good_units": good_units,
+                "defect_count": defect_count,
+            }
+            if "timestamp" in process_data_columns:
+                insert_data["timestamp"] = logged_at
+            if "tag_name" in process_data_columns:
+                insert_data["tag_name"] = "order_result"
+            if "value" in process_data_columns:
+                insert_data["value"] = result_message or final_status
+            if "station" in process_data_columns:
+                insert_data["station"] = str(station_id) if station_id is not None else ""
+
+            columns = [column for column in insert_data if column in process_data_columns]
+            placeholders = ", ".join("?" for _ in columns)
+            sql = (
+                f"INSERT INTO process_data ({', '.join(columns)}) "
+                f"VALUES ({placeholders})"
+            )
+            connection.execute(sql, tuple(insert_data[column] for column in columns))
             connection.commit()
 
         self.last_error = ""
 
-    def list_process_data(self, order_id: str | None = None) -> list[dict]:
+    def list_process_data(self, order_id: int | None = None) -> list[dict]:
         with self._connect() as connection:
             process_data_columns = self._table_columns(connection, "process_data")
             select_columns = [
@@ -526,9 +642,17 @@ class MesManager:
                 for column in [
                     "id",
                     "order_id",
+                    "business_order_id",
                     "station_id",
+                    "recipe",
+                    "rfid_tag",
                     "actual_start",
                     "actual_end",
+                    "final_status",
+                    "result_message",
+                    "fault_code",
+                    "cycle_complete",
+                    "logged_at",
                     "good_units",
                     "defect_count",
                 ]
@@ -559,6 +683,23 @@ class MesManager:
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
         return connection
+
+    def _update_order_fields(self, order_pk: int, fields: dict[str, object]) -> bool:
+        assignments = ", ".join(f"{column} = ?" for column in fields)
+        parameters = tuple(fields.values()) + (order_pk,)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE production_orders SET {assignments} WHERE id = ?",
+                parameters,
+            )
+            connection.commit()
+
+        if cursor.rowcount == 0:
+            self.last_error = f"Order with id={order_pk} not found."
+            return False
+
+        self.last_error = ""
+        return True
 
     @staticmethod
     def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
@@ -609,4 +750,6 @@ class MesManager:
             created_at=row["created_at"],
             priority=row["priority"],
             rfid_tag=row["rfid_tag"],
+            updated_at=row["updated_at"] if "updated_at" in row.keys() else None,
+            last_result=row["last_result"] if "last_result" in row.keys() else None,
         )

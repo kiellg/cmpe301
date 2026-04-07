@@ -277,6 +277,8 @@ class MesView(QObject):
                 QTableWidgetItem(order.created_at),
                 QTableWidgetItem(str(order.priority)),
                 QTableWidgetItem(order.rfid_tag if order.rfid_tag is not None else "--"),
+                QTableWidgetItem(order.last_result if order.last_result is not None else "--"),
+                QTableWidgetItem(order.updated_at if order.updated_at is not None else "--"),
             ]
             for col_index, item in enumerate(items):
                 if row_colour is not None:
@@ -404,6 +406,21 @@ class MesView(QObject):
         self.main_window.priority_spin.setMaximum(10)
         self._configure_table(self.station_editor.stations_table)
         self._configure_table(self.main_window.orders_table)
+        self.main_window.orders_table.setColumnCount(10)
+        self.main_window.orders_table.setHorizontalHeaderLabels(
+            [
+                "Order ID",
+                "Recipe",
+                "Quantity",
+                "Status",
+                "Created By",
+                "Created At",
+                "Priority",
+                "RFID Tag",
+                "Last Result",
+                "Last Update",
+            ]
+        )
 
         if self.main_window.recipe_combo.count() == 0:
             self.main_window.recipe_combo.addItems(
