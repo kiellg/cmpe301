@@ -3,3 +3,4 @@ __pycache__/
 test_runtime/
 .pytest_cache/
 pytest-cache-files-*/
+.claude/
