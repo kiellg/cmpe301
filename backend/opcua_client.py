@@ -9,7 +9,7 @@ Architecture overview
 PlcClient (QThread)
   └─ run()                        ← worker thread entry
        ├─ _connect()              ← builds node map, registers subscriptions
-       ├─ _poll_loop()            ← 100 ms heartbeat (safety net for missed events)
+       ├─ _poll_loop()            ← 100 ms idle loop; subscriptions drive live events
        └─ _cleanup()              ← tears down subscription + disconnects
 
 OpcUaSubscriptionHandler          ← opcua library callback, routes to PlcClient signals
@@ -80,7 +80,8 @@ NODE_PATHS: dict[str, str] = {
 }
 
 # Nodes that the OPC UA subscription monitors for event-driven callbacks.
-# Polling is a fallback; the subscription is the primary notification path.
+# The current event flow depends on these subscriptions; _poll_loop() is idle
+# until periodic reads are added there.
 SUBSCRIBED_ALIASES: frozenset[str] = frozenset({
     "appDone",
     "awaitApp",
@@ -224,8 +225,9 @@ class PlcClient(QThread):
     OPC UA client for the Siemens S7-1512SP PLC, running in a QThread.
 
     The worker thread (run()) connects to the PLC, sets up subscriptions, and
-    runs a lightweight polling loop.  GUI-thread code interacts with the PLC
-    exclusively through:
+    runs a lightweight background loop.  Live node-change handling currently
+    comes from subscriptions; the loop is a placeholder for periodic reads.
+    GUI-thread code interacts with the PLC exclusively through:
       - Qt signals (received events from the PLC)
       - write_node() / read_node() / dispatch_order() (commands to the PLC)
 
@@ -291,8 +293,8 @@ class PlcClient(QThread):
 
     def start_client(self) -> None:
         """
-        Start the background worker thread.  Call once from the GUI thread after
-        connecting signals to controller slots.
+        Start the background worker thread from the GUI thread after signal
+        wiring is in place.
         """
         self._stop_event.clear()
         self.start()  # invokes run() in the new thread
@@ -307,8 +309,8 @@ class PlcClient(QThread):
 
     def dispatch_order(self, order_id: int, task_code: int, quantity: int) -> bool:
         """
-        Send a production order to the PLC.  Must be called from the GUI thread
-        in response to the await_app signal (PLC ready for a new job).
+        Send a production order to the PLC from the GUI thread when the PLC is
+        ready for a new job.
 
         Write sequence — DO NOT reorder these steps:
 
@@ -531,15 +533,14 @@ class PlcClient(QThread):
 
     def _poll_loop(self) -> None:
         """
-        100 ms polling loop.  Runs after a successful _connect().
+        100 ms background loop.  Runs after a successful _connect().
 
-        The OPC UA subscription is the primary notification path for appDone,
-        awaitApp, readDone, and readPresence.  This loop is a safety net:
-        if a subscription notification is missed (network glitch, PLC restart),
-        the next poll will catch it.
+        The OPC UA subscription is the only active notification path for
+        appDone, awaitApp, readDone, and readPresence in the current code.
+        This loop is intentionally idle until periodic reads are added here.
 
-        Additional periodic reads (e.g. drillDone, machine mode display) can
-        be added here without touching the subscription handler.
+        Additional periodic reads (for example drillDone or machine mode
+        display) can be added here without touching the subscription handler.
 
         Exits when _stop_event is set or an unhandled exception propagates
         (causing run() to catch it and attempt reconnection).
@@ -671,8 +672,3 @@ class PlcClient(QThread):
         except Exception:  # noqa: BLE001
             return False
 
-
-# ---------------------------------------------------------------------------
-# Integration checklist
-# ---------------------------------------------------------------------------
-#
