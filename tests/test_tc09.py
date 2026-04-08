@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from plc_client import RECIPE_TASK_CODES
+from opcua_client import RECIPE_TASK_CODES
 
 
 def test_tc09_supported_recipe_mapping_matches_current_python_codes():

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from model import MesManager
-from plc_client import decode_rfid, encode_rfid, format_rfid_trace
+from opcua_client import decode_rfid, encode_rfid, format_rfid_trace
 
 
 def test_tc07_rfid_python_payload_round_trip_and_trace_format():

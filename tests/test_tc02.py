@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from plc_client import PlcClient, RECIPE_TASK_CODES, encode_rfid
+from opcua_client import PlcClient, RECIPE_TASK_CODES, encode_rfid
 
 
 def test_tc02_dispatch_order_writes_expected_python_side_sequence(monkeypatch):

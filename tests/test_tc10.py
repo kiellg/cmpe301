@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from plc_client import PlcClient
+from opcua_client import PlcClient
 
 
 def test_tc10_controller_marks_active_order_failed_on_simulated_plc_error(

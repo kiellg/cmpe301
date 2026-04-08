@@ -530,7 +530,7 @@ class MesManager:
 
         :param order_pk: The production_orders.id (integer PK), as returned by
                          list_orders() as ProductionOrder.id and encoded into
-                         the RFID tag by plc_client.encode_rfid().
+                         the RFID tag by opcua_client.encode_rfid().
         :param status:   New status string: "Pending", "In Progress",
                          "Completed", or "Failed".
         """

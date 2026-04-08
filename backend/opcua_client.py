@@ -1,6 +1,6 @@
 """
-backend/plc_client.py
-=====================
+backend/opcua_client.py
+=======================
 OPC UA client for the Siemens S7-1512SP PLC, wrapped in a QThread so it runs
 alongside the PyQt5 event loop without blocking the GUI.
 
@@ -16,12 +16,12 @@ OpcUaSubscriptionHandler          ← opcua library callback, routes to PlcClien
   └─ datachange_notification()    ← called by opcua's internal subscription thread
 
 Integration in mes_app.py (TODO — see bottom of file):
-    plc = PlcClient()
-    plc.rfid_tag_read.connect(controller.handle_rfid_tag_read)
-    plc.app_done.connect(controller.handle_app_done)
-    plc.await_app.connect(controller.handle_await_app)
-    plc.error.connect(controller.handle_plc_error)
-    plc.start_client()
+    client = PlcClient()
+    client.rfid_tag_read.connect(controller.handle_rfid_tag_read)
+    client.app_done.connect(controller.handle_app_done)
+    client.await_app.connect(controller.handle_await_app)
+    client.error.connect(controller.handle_plc_error)
+    client.start_client()
 """
 
 from __future__ import annotations
@@ -331,9 +331,9 @@ class PlcClient(QThread):
         :param quantity:  Units to produce.  Must fit in uint32.
 
         TODO (controller.py):
-            Connect plc_client.await_app to a controller slot that identifies
+            Connect client.await_app to a controller slot that identifies
             the next Pending order and calls:
-                plc_client.dispatch_order(order.id, task_code, order.quantity)
+                client.dispatch_order(order.id, task_code, order.quantity)
         """
         if not self._connected:
             self.last_error = "dispatch_order: PLC not connected — skipping"
@@ -611,14 +611,14 @@ class PlcClient(QThread):
         misses its own reset and re-fires the flag unexpectedly.
 
         TODO (controller.py):
-            Connect plc_client.rfid_tag_read to controller.handle_rfid_tag_read:
+            Connect client.rfid_tag_read to controller.handle_rfid_tag_read:
                 def handle_rfid_tag_read(self, data: dict) -> None:
                     order = self.model.get_order_by_id(data["order_id"])
                     if order:
                         self.model.update_order_status(order.order_id, "In Progress")
                         # record actual_start timestamp
                     else:
-                        self.plc_client.error.emit(
+                        self.client.error.emit(
                             f"RFID tag has unknown order_id={data['order_id']}"
                         )
         """
@@ -647,7 +647,7 @@ class PlcClient(QThread):
         does not attempt to dispatch the next order before the PLC is ready.
 
         TODO (controller.py):
-            Connect plc_client.app_done to controller.handle_app_done:
+            Connect client.app_done to controller.handle_app_done:
                 def handle_app_done(self) -> None:
                     if self._active_order_id:
                         self.model.update_order_status(
@@ -713,7 +713,7 @@ class PlcClient(QThread):
 #
 # mes_app.py  — TODO: wire PlcClient into the application:
 #
-#     from plc_client import PlcClient
+#     from opcua_client import PlcClient
 #
 #     def create_app(...):
 #         ...
@@ -737,4 +737,4 @@ class PlcClient(QThread):
 #         """Mark active order Completed, log process data, record actual_end."""
 #
 #     def handle_await_app(self) -> None:
-#         """Identify next Pending order, call plc_client.dispatch_order()."""
+#         """Identify next Pending order, call client.dispatch_order()."""

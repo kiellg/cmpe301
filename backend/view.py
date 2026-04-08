@@ -27,7 +27,7 @@ from PyQt5.QtWidgets import (
 )
 
 from model import ProductionOrder, Station
-from plc_client import encode_rfid, RECIPE_TASK_CODES
+from opcua_client import encode_rfid, RECIPE_TASK_CODES
 
 
 class WriteTagDialog(QDialog):

@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import QApplication
 
 from controller import MesController
 from model import DEFAULT_DB_PATH, MesManager
-from plc_client import PlcClient
+from opcua_client import PlcClient
 from view import MesView
 
 

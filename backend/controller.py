@@ -4,7 +4,7 @@ import sys
 from datetime import datetime, timezone
 
 from model import MesManager, ProductionOrder
-from plc_client import RECIPE_TASK_CODES, PlcClient, format_rfid_trace
+from opcua_client import RECIPE_TASK_CODES, PlcClient, format_rfid_trace
 from view import MesView
 
 
