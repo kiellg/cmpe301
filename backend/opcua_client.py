@@ -9,7 +9,7 @@ Architecture overview
 PlcClient (QThread)
   └─ run()                        ← worker thread entry
        ├─ _connect()              ← builds node map, registers subscriptions
-       ├─ _poll_loop()            ← 100 ms idle loop; subscriptions drive live events
+       ├─ _poll_loop()            ← 100 ms fallback poll for workflow booleans
        └─ _cleanup()              ← tears down subscription + disconnects
 
 OpcUaSubscriptionHandler          ← opcua library callback, routes to PlcClient signals
@@ -79,9 +79,9 @@ NODE_PATHS: dict[str, str] = {
     "writeData": '"identData"."writeData"',         # Array[0..31] of Byte
 }
 
-# Nodes that the OPC UA subscription monitors for event-driven callbacks.
-# The current event flow depends on these subscriptions; _poll_loop() is idle
-# until periodic reads are added there.
+# Nodes that drive the MES workflow. OPC UA subscriptions are the primary event
+# path, and _poll_loop() re-reads these aliases as a fallback in case a
+# subscription notification is missed.
 SUBSCRIBED_ALIASES: frozenset[str] = frozenset({
     "appDone",
     "awaitApp",
@@ -168,10 +168,9 @@ class OpcUaSubscriptionHandler:
     Implements the opcua SubHandler interface.
 
     The opcua library calls datachange_notification() from its own internal
-    subscription thread whenever a monitored node value changes.  This class
-    translates those raw callbacks into PlcClient method calls, which in turn
-    emit Qt signals.  Qt signals are thread-safe, so emitting them from the
-    subscription thread is correct.
+    subscription thread whenever a monitored node value changes. This class
+    routes those raw callbacks through PlcClient so subscriptions and fallback
+    polling share the same rising-edge handling logic.
 
     Subscribed nodes: appDone, awaitApp, readDone, readPresence.
     """
@@ -192,22 +191,7 @@ class OpcUaSubscriptionHandler:
             if alias is None:
                 return  # Not a tracked node — ignore
 
-            # Always emit generic data_changed so the GUI can display live values
-            self._plc.data_changed.emit(alias, val)
-
-            # Specific handlers for nodes that drive the production workflow.
-            # Only act on rising edges (True) to avoid double-triggering.
-            if alias == "appDone" and bool(val):
-                # PLC finished drilling cycle → reset PLC flag, notify controller
-                self._plc._on_app_done()
-
-            elif alias == "awaitApp" and bool(val):
-                # PLC stepped into the "await MES command" GRAPH state
-                self._plc.await_app.emit()
-
-            elif alias == "readDone" and bool(val):
-                # RF210R finished reading RFID tag → decode and emit rfid_tag_read
-                self._plc._on_rfid_read_done()
+            self._plc._handle_observed_alias(alias, val)
 
         except Exception as exc:  # noqa: BLE001
             self._plc.error.emit(f"Subscription handler exception: {exc}")
@@ -225,8 +209,8 @@ class PlcClient(QThread):
     OPC UA client for the Siemens S7-1512SP PLC, running in a QThread.
 
     The worker thread (run()) connects to the PLC, sets up subscriptions, and
-    runs a lightweight background loop.  Live node-change handling currently
-    comes from subscriptions; the loop is a placeholder for periodic reads.
+    runs a lightweight background loop. Subscriptions are the primary source of
+    live updates, and the loop re-reads key workflow booleans as a fallback.
     GUI-thread code interacts with the PLC exclusively through:
       - Qt signals (received events from the PLC)
       - write_node() / read_node() / dispatch_order() (commands to the PLC)
@@ -275,6 +259,11 @@ class PlcClient(QThread):
         # Protects dispatch_order() against concurrent calls from the GUI thread
         # and avoids interleaving writes with subscription callbacks.
         self._write_lock = threading.Lock()
+
+        # Tracks the last observed value for subscription-backed workflow nodes
+        # so subscriptions and fallback polling share one rising-edge gate.
+        self._observed_lock = threading.Lock()
+        self._observed_values: dict[str, bool] = {}
 
         # Set by stop_client() to break the poll loop and reconnect loop
         self._stop_event = threading.Event()
@@ -529,28 +518,32 @@ class PlcClient(QThread):
         self._write_node("doWrite", False)
         logger.debug("Control flags reset to False")
 
+        with self._observed_lock:
+            self._observed_values = {
+                alias: self._read_bool(alias)
+                for alias in SUBSCRIBED_ALIASES
+            }
+
         self.connected.emit()
 
     def _poll_loop(self) -> None:
         """
         100 ms background loop.  Runs after a successful _connect().
 
-        The OPC UA subscription is the only active notification path for
-        appDone, awaitApp, readDone, and readPresence in the current code.
-        This loop is intentionally idle until periodic reads are added here.
-
-        Additional periodic reads (for example drillDone or machine mode
-        display) can be added here without touching the subscription handler.
+        OPC UA subscriptions remain the primary event path. This loop re-reads
+        the key workflow booleans so the MES still reacts if a subscription
+        notification is missed.
 
         Exits when _stop_event is set or an unhandled exception propagates
         (causing run() to catch it and attempt reconnection).
         """
         logger.debug("Poll loop started")
         while not self._stop_event.is_set():
-            # Subscription handles primary event flow — poll is a backstop only.
-            # Add periodic reads here as needed, e.g.:
-            #   drill_done = self._read_bool("drillDone")
-            #   self.data_changed.emit("drillDone", drill_done)
+            for alias in SUBSCRIBED_ALIASES:
+                node = self._nodes.get(alias)
+                if node is None:
+                    raise KeyError(f"_poll_loop: missing node for alias {alias!r}")
+                self._handle_observed_alias(alias, node.get_value())
             time.sleep(POLL_INTERVAL_S)
         logger.debug("Poll loop exited")
 
@@ -579,6 +572,8 @@ class PlcClient(QThread):
 
         self._nodes.clear()
         self._node_id_to_alias.clear()
+        with self._observed_lock:
+            self._observed_values.clear()
 
         if was_connected:
             self.disconnected.emit()
@@ -636,6 +631,38 @@ class PlcClient(QThread):
         except Exception as exc:  # noqa: BLE001
             self.error.emit(f"_on_app_done error: {exc}")
 
+    def _handle_observed_alias(self, alias: str, value: object) -> None:
+        """
+        Process a workflow alias observed from either subscriptions or fallback
+        polling, emitting signals only on value changes and firing workflow
+        handlers on rising edges.
+        """
+        observed_value = bool(value)
+        should_emit_data_changed = False
+        should_emit_await_app = False
+        should_handle_app_done = False
+        should_handle_rfid_read = False
+
+        with self._observed_lock:
+            previous = self._observed_values.get(alias)
+            if previous is None or previous != observed_value:
+                self._observed_values[alias] = observed_value
+                should_emit_data_changed = True
+
+                if observed_value:
+                    should_handle_app_done = alias == "appDone"
+                    should_emit_await_app = alias == "awaitApp"
+                    should_handle_rfid_read = alias == "readDone"
+
+        if should_emit_data_changed:
+            self.data_changed.emit(alias, observed_value)
+        if should_handle_app_done:
+            self._on_app_done()
+        if should_emit_await_app:
+            self.await_app.emit()
+        if should_handle_rfid_read:
+            self._on_rfid_read_done()
+
     # ------------------------------------------------------------------
     # Low-level node I/O (no error handling — callers must handle exceptions)
     # ------------------------------------------------------------------
@@ -671,4 +698,3 @@ class PlcClient(QThread):
             return bool(node.get_value()) if node is not None else False
         except Exception:  # noqa: BLE001
             return False
-

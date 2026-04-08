@@ -5,6 +5,21 @@ from __future__ import annotations
 from opcua_client import PlcClient
 
 
+class _SequencedBoolNode:
+    """Minimal fake OPC UA node that returns a scripted sequence of boolean values."""
+
+    def __init__(self, values: list[bool]) -> None:
+        self._values = list(values)
+        self._index = 0
+
+    def get_value(self) -> bool:
+        if self._index >= len(self._values):
+            return self._values[-1]
+        value = self._values[self._index]
+        self._index += 1
+        return value
+
+
 def test_tc10_controller_marks_active_order_failed_on_simulated_plc_error(
     manager_factory,
     controller_factory,
@@ -55,3 +70,30 @@ def test_tc10_plc_client_run_emits_reconnect_error_when_connect_fails(monkeypatc
 
     assert cleanup_calls == ["cleanup", "cleanup"]
     assert any("PLC connection error: boom" in message for message in errors)
+
+
+def test_tc10_poll_loop_recovers_missed_app_done_subscription(monkeypatch):
+    """Verify fallback polling completes the order flow when an appDone event is missed."""
+    plc = PlcClient()
+    completions: list[str] = []
+    sleep_calls = {"count": 0}
+
+    plc._nodes = {
+        "appDone": _SequencedBoolNode([False, True]),
+        "awaitApp": _SequencedBoolNode([False, False]),
+        "readDone": _SequencedBoolNode([False, False]),
+        "readPresence": _SequencedBoolNode([False, False]),
+    }
+    plc.app_done.connect(lambda: completions.append("done"))
+    monkeypatch.setattr(plc, "_write_node", lambda alias, value: None)
+
+    def fake_sleep(_seconds: float) -> None:
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] >= 2:
+            plc._stop_event.set()
+
+    monkeypatch.setattr("opcua_client.time.sleep", fake_sleep)
+
+    plc._poll_loop()
+
+    assert completions == ["done"]
