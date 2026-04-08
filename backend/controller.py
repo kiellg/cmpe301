@@ -262,6 +262,12 @@ class MesController:
             f"conv_start received for order {self._active_order['order_id']} at {started_at}"
         )
 
+        if bool(self.plc_client.read_node("conv_end")):
+            self.view.append_plc_log(
+                f"conv_end already high for order {self._active_order['order_id']} after conv_start"
+            )
+            self.handle_conv_end()
+
     def handle_conv_end(self) -> None:
         if self._active_order is None:
             self.view.append_plc_log("conv_end fired but no active order tracked")
@@ -333,6 +339,18 @@ class MesController:
         self.view.append_plc_log("Connected to PLC")
 
         if self._active_order is not None:
+            if not self._active_order.get("started") and bool(self.plc_client.read_node("conv_start")):
+                self.view.append_plc_log(
+                    f"conv_start already high for active order {self._active_order['order_id']} after reconnect"
+                )
+                self.handle_conv_start()
+                return
+
+            if self._active_order.get("started") and bool(self.plc_client.read_node("conv_end")):
+                self.view.append_plc_log(
+                    f"conv_end already high for active order {self._active_order['order_id']} after reconnect"
+                )
+                self.handle_conv_end()
             return
 
         order = self._next_dispatchable_order()
