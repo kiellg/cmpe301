@@ -456,6 +456,8 @@ class MesView(QObject):
             ("appRun", "DB1"),
             ("appDone", "DB1"),
             ("awaitApp", "DB1"),
+            ("conv_start", "DB1"),
+            ("conv_end", "DB1"),
             ("drillDone", "DB1"),
             ("taskCode", "DB1"),
             ("doRead", "DB3"),

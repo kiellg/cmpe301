@@ -60,8 +60,10 @@ NODE_PATHS: dict[str, str] = {
     # abstractMachine [DB1] — GRAPH sequence control
     "taskCode":   '"abstractMachine"."taskCode"',   # Byte  — TCP byte 0 to Festo CECC
     "awaitApp":   '"abstractMachine"."awaitApp"',   # Bool  — PLC waiting for MES command
-    "appRun":     '"abstractMachine"."appRun"',     # Bool  — MES sets True to start cycle
-    "appDone":    '"abstractMachine"."appDone"',    # Bool  — PLC sets True when done
+    "appRun":     '"abstractMachine"."appRun"',     # Bool  — MES sets True to arm the cycle
+    "appDone":    '"abstractMachine"."appDone"',    # Bool  — PLC done flag (monitored only)
+    "conv_start": '"abstractMachine"."conv_start"', # Bool  — conveyor/cycle start reached
+    "conv_end":   '"abstractMachine"."conv_end"',   # Bool  — conveyor/cycle end reached
     "sendTCPcmd": '"abstractMachine"."sendTCPcmd"', # Bool  — triggers 2-byte TCP frame
     "drillDone":  '"abstractMachine"."drillDone"',  # Bool  — drilling op complete
     "release":    '"abstractMachine"."release"',    # Bool  — release / reset
@@ -85,6 +87,8 @@ NODE_PATHS: dict[str, str] = {
 SUBSCRIBED_ALIASES: frozenset[str] = frozenset({
     "appDone",
     "awaitApp",
+    "conv_start",
+    "conv_end",
     "readDone",
     "readPresence",
 })
@@ -172,7 +176,7 @@ class OpcUaSubscriptionHandler:
     routes those raw callbacks through PlcClient so subscriptions and fallback
     polling share the same rising-edge handling logic.
 
-    Subscribed nodes: appDone, awaitApp, readDone, readPresence.
+    Subscribed nodes: appDone, awaitApp, conv_start, conv_end, readDone, readPresence.
     """
 
     def __init__(self, plc_client: "PlcClient") -> None:
@@ -220,7 +224,8 @@ class PlcClient(QThread):
     connected        Emitted once after a successful OPC UA connect.
     disconnected     Emitted when the connection is lost or stop_client() called.
     rfid_tag_read    Emitted with parsed RFID payload when readDone fires.
-    app_done         Emitted after the drilling cycle completes (appDone → True).
+    conv_start       Emitted when the PLC raises the conveyor start tag.
+    conv_end         Emitted when the PLC raises the conveyor end tag.
     await_app        Emitted when the PLC enters the "await MES" GRAPH state.
     data_changed     Emitted for every subscribed node value change (node alias, value).
     error            Emitted with a human-readable message on any fault.
@@ -239,7 +244,8 @@ class PlcClient(QThread):
     connected:     pyqtSignal = pyqtSignal()
     disconnected:  pyqtSignal = pyqtSignal()
     rfid_tag_read: pyqtSignal = pyqtSignal(dict)    # {"order_id": int, "task_code": int, "quantity": int}
-    app_done:      pyqtSignal = pyqtSignal()
+    conv_start:    pyqtSignal = pyqtSignal()
+    conv_end:      pyqtSignal = pyqtSignal()
     await_app:     pyqtSignal = pyqtSignal()
     data_changed:  pyqtSignal = pyqtSignal(str, object)  # (node_alias, new_value)
     error:         pyqtSignal = pyqtSignal(str)
@@ -308,7 +314,8 @@ class PlcClient(QThread):
           2. writeData  ← Serialize order into 32-byte RFID payload (DB2).
           3. doWrite    ← Trigger RF210R IO-Link write to the physical RFID tag.
           4. writeDone  ← Poll until PLC confirms write (or 5 s timeout).
-          5. appRun     ← Kick the GRAPH sequence; PLC sends TCP frame to Festo.
+          5. appRun     ← Kick the GRAPH sequence; the PLC then raises conv_start
+                           and conv_end as the station enters and leaves execution.
 
         :param order_id:  Numeric order identifier.  Must fit in uint32.
         :param task_code: Recipe code 0-3 from RECIPE_TASK_CODES.
@@ -373,7 +380,7 @@ class PlcClient(QThread):
                 # Only reached if taskCode and RFID write both succeeded.
                 # The PLC GRAPH transitions to the drilling state, fires
                 # sendTCPcmd to the Festo CECC (2-byte frame: taskCode, 0x01),
-                # and eventually sets appDone=True when complete.
+                # and later raises conv_start / conv_end as execution progresses.
                 self._write_node("appRun", True)
                 logger.info(
                     "Step 5 OK appRun=True — drilling started "
@@ -514,7 +521,6 @@ class PlcClient(QThread):
         # Reset control flags to known-good state.
         # A prior session crash may have left stale True values on the PLC.
         self._write_node("appRun",  False)
-        self._write_node("appDone", False)
         self._write_node("doWrite", False)
         logger.debug("Control flags reset to False")
 
@@ -609,27 +615,27 @@ class PlcClient(QThread):
         except Exception as exc:  # noqa: BLE001
             self.error.emit(f"_on_rfid_read_done error: {exc}")
 
-    def _on_app_done(self) -> None:
+    def _on_conv_start(self) -> None:
         """
-        Handle the appDone → True transition.
-
-        Resets appDone=False on the PLC before emitting app_done.  The GRAPH
-        sequence waits in the "appDone" step until the flag is cleared; if the
-        MES does not clear it, the PLC stalls and cannot accept the next job.
-
-        The app_done signal is emitted AFTER the PLC reset so the controller
-        does not attempt to dispatch the next order before the PLC is ready.
-
+        Handle the conv_start → True transition by notifying the controller.
         """
         try:
-            # PLC handshake: clear appDone so GRAPH can advance to the idle step.
-            # This MUST happen before the controller dispatches the next order.
-            self._write_node("appDone", False)
-            logger.info("appDone cleared on PLC, emitting app_done signal")
-            self.app_done.emit()
+            logger.info("conv_start observed, emitting conv_start signal")
+            self.conv_start.emit()
 
         except Exception as exc:  # noqa: BLE001
-            self.error.emit(f"_on_app_done error: {exc}")
+            self.error.emit(f"_on_conv_start error: {exc}")
+
+    def _on_conv_end(self) -> None:
+        """
+        Handle the conv_end → True transition by notifying the controller.
+        """
+        try:
+            logger.info("conv_end observed, emitting conv_end signal")
+            self.conv_end.emit()
+
+        except Exception as exc:  # noqa: BLE001
+            self.error.emit(f"_on_conv_end error: {exc}")
 
     def _handle_observed_alias(self, alias: str, value: object) -> None:
         """
@@ -640,7 +646,8 @@ class PlcClient(QThread):
         observed_value = bool(value)
         should_emit_data_changed = False
         should_emit_await_app = False
-        should_handle_app_done = False
+        should_handle_conv_start = False
+        should_handle_conv_end = False
         should_handle_rfid_read = False
 
         with self._observed_lock:
@@ -650,16 +657,19 @@ class PlcClient(QThread):
                 should_emit_data_changed = True
 
                 if observed_value:
-                    should_handle_app_done = alias == "appDone"
                     should_emit_await_app = alias == "awaitApp"
+                    should_handle_conv_start = alias == "conv_start"
+                    should_handle_conv_end = alias == "conv_end"
                     should_handle_rfid_read = alias == "readDone"
 
         if should_emit_data_changed:
             self.data_changed.emit(alias, observed_value)
-        if should_handle_app_done:
-            self._on_app_done()
         if should_emit_await_app:
             self.await_app.emit()
+        if should_handle_conv_start:
+            self._on_conv_start()
+        if should_handle_conv_end:
+            self._on_conv_end()
         if should_handle_rfid_read:
             self._on_rfid_read_done()
 

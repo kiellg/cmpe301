@@ -20,21 +20,23 @@ class _SequencedBoolNode:
         return value
 
 
-def test_tc10_controller_marks_active_order_failed_on_simulated_plc_error(
+def test_tc10_controller_keeps_active_order_non_failed_on_simulated_plc_error(
     manager_factory,
     controller_factory,
     fake_view,
 ):
-    """Verify controller error handling marks the active order failed and logs history."""
+    """Verify controller error handling logs the issue without auto-failing the active order."""
     model = manager_factory()
     model.add_station("Drilling", "172.21.3.1", "", True)
     order = model.add_order("PO-FAIL", "Left Holes", 2, "operator1", priority=1)
+    model.update_order_status(order.id, "In Progress", last_result="conv_start received from PLC")
     controller = controller_factory(model, view=fake_view)
     controller._active_order = {
         "db_id": order.id,
         "order_id": order.order_id,
         "recipe": order.recipe,
         "quantity": order.quantity,
+        "started": True,
         "start": "2026-04-08T12:00:00+00:00",
         "rfid_tag": f"dbid={order.id};task=1;qty=2",
     }
@@ -44,12 +46,11 @@ def test_tc10_controller_marks_active_order_failed_on_simulated_plc_error(
     updated = model.get_order_by_id(order.id)
     history = model.list_process_data(order.id)
     assert updated is not None
-    assert updated.status == "Failed"
+    assert updated.status == "In Progress"
     assert updated.last_result == "dispatch_order: writeDone timeout after 5s"
-    assert controller._active_order is None
-    assert history[0]["final_status"] == "Failed"
-    assert history[0]["fault_code"] == "dispatch_order: writeDone timeout after 5s"
-    assert fake_view.machine_states[-1] == "Execution failed - see PLC log"
+    assert controller._active_order is not None
+    assert history == []
+    assert fake_view.machine_states[-1].startswith("PLC error:")
 
 
 def test_tc10_plc_client_run_emits_reconnect_error_when_connect_fails(monkeypatch):
@@ -72,20 +73,21 @@ def test_tc10_plc_client_run_emits_reconnect_error_when_connect_fails(monkeypatc
     assert any("PLC connection error: boom" in message for message in errors)
 
 
-def test_tc10_poll_loop_recovers_missed_app_done_subscription(monkeypatch):
-    """Verify fallback polling completes the order flow when an appDone event is missed."""
+def test_tc10_poll_loop_recovers_missed_conv_end_subscription(monkeypatch):
+    """Verify fallback polling emits conv_end when the PLC end tag changes without a subscription event."""
     plc = PlcClient()
     completions: list[str] = []
     sleep_calls = {"count": 0}
 
     plc._nodes = {
-        "appDone": _SequencedBoolNode([False, True]),
+        "appDone": _SequencedBoolNode([False, False]),
         "awaitApp": _SequencedBoolNode([False, False]),
+        "conv_start": _SequencedBoolNode([False, False]),
+        "conv_end": _SequencedBoolNode([False, True]),
         "readDone": _SequencedBoolNode([False, False]),
         "readPresence": _SequencedBoolNode([False, False]),
     }
-    plc.app_done.connect(lambda: completions.append("done"))
-    monkeypatch.setattr(plc, "_write_node", lambda alias, value: None)
+    plc.conv_end.connect(lambda: completions.append("done"))
 
     def fake_sleep(_seconds: float) -> None:
         sleep_calls["count"] += 1

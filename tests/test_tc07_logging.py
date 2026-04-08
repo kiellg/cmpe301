@@ -5,12 +5,12 @@ from __future__ import annotations
 from model import MesManager
 
 
-def test_tc07_logging_handle_app_done_records_completed_history(
+def test_tc07_logging_handle_conv_end_records_completed_history(
     manager_factory,
     controller_factory,
     fake_view,
 ):
-    """Verify completion logging writes both order status and process history rows."""
+    """Verify conv_end completion writes both order status and process history rows."""
     model = manager_factory()
     model.add_station("Drilling", "172.21.3.1", "", True)
     order = model.add_order("PO-3001", "All Holes", 3, "operator1", priority=3)
@@ -20,20 +20,21 @@ def test_tc07_logging_handle_app_done_records_completed_history(
         "order_id": order.order_id,
         "recipe": order.recipe,
         "quantity": order.quantity,
+        "started": True,
         "start": "2026-04-08T10:00:00+00:00",
         "rfid_tag": f"dbid={order.id};task=3;qty=3",
     }
 
-    controller.handle_app_done()
+    controller.handle_conv_end()
 
     updated = model.get_order_by_id(order.id)
     history = model.list_process_data(order.id)
     assert updated is not None
     assert updated.status == "Completed"
-    assert updated.last_result == "Completed at drilling station"
+    assert updated.last_result == "conv_end received from PLC"
     assert history[0]["final_status"] == "Completed"
     assert history[0]["actual_start"] == "2026-04-08T10:00:00+00:00"
-    assert history[0]["result_message"] == "PLC appDone received"
+    assert history[0]["result_message"] == "PLC conv_end received"
     assert history[0]["good_units"] == 3
     assert history[0]["defect_count"] == 0
 
@@ -45,8 +46,8 @@ def test_tc07_logging_persists_history_after_reopening_same_database(workspace_t
     order = manager.add_order("PO-3002", "Left Holes", 2, "operator1", priority=1)
     manager.update_order_status(
         order.id,
-        "Failed",
-        last_result="Simulated timeout",
+        "Completed",
+        last_result="conv_end received from PLC",
         updated_at="2026-04-08T11:00:00+00:00",
     )
     manager.log_process_data(
@@ -56,11 +57,11 @@ def test_tc07_logging_persists_history_after_reopening_same_database(workspace_t
         recipe=order.recipe,
         actual_start="2026-04-08T10:55:00+00:00",
         actual_end="2026-04-08T11:00:00+00:00",
-        final_status="Failed",
-        result_message="Simulated timeout",
-        fault_code="Simulated timeout",
+        final_status="Completed",
+        result_message="PLC conv_end received",
+        cycle_complete=True,
         logged_at="2026-04-08T11:00:00+00:00",
-        good_units=0,
+        good_units=2,
         defect_count=0,
     )
 
@@ -69,8 +70,8 @@ def test_tc07_logging_persists_history_after_reopening_same_database(workspace_t
     persisted_history = reopened.list_process_data(order.id)
 
     assert persisted_order is not None
-    assert persisted_order.status == "Failed"
-    assert persisted_order.last_result == "Simulated timeout"
+    assert persisted_order.status == "Completed"
+    assert persisted_order.last_result == "conv_end received from PLC"
     assert persisted_history == [
         {
             "id": 1,
@@ -81,12 +82,12 @@ def test_tc07_logging_persists_history_after_reopening_same_database(workspace_t
             "rfid_tag": None,
             "actual_start": "2026-04-08T10:55:00+00:00",
             "actual_end": "2026-04-08T11:00:00+00:00",
-            "final_status": "Failed",
-            "result_message": "Simulated timeout",
-            "fault_code": "Simulated timeout",
-            "cycle_complete": 0,
+            "final_status": "Completed",
+            "result_message": "PLC conv_end received",
+            "fault_code": None,
+            "cycle_complete": 1,
             "logged_at": "2026-04-08T11:00:00+00:00",
-            "good_units": 0,
+            "good_units": 2,
             "defect_count": 0,
         }
     ]
