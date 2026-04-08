@@ -15,13 +15,6 @@ PlcClient (QThread)
 OpcUaSubscriptionHandler          ← opcua library callback, routes to PlcClient signals
   └─ datachange_notification()    ← called by opcua's internal subscription thread
 
-Integration in mes_app.py (TODO — see bottom of file):
-    client = PlcClient()
-    client.rfid_tag_read.connect(controller.handle_rfid_tag_read)
-    client.app_done.connect(controller.handle_app_done)
-    client.await_app.connect(controller.handle_await_app)
-    client.error.connect(controller.handle_plc_error)
-    client.start_client()
 """
 
 from __future__ import annotations
@@ -330,10 +323,6 @@ class PlcClient(QThread):
         :param task_code: Recipe code 0-3 from RECIPE_TASK_CODES.
         :param quantity:  Units to produce.  Must fit in uint32.
 
-        TODO (controller.py):
-            Connect client.await_app to a controller slot that identifies
-            the next Pending order and calls:
-                client.dispatch_order(order.id, task_code, order.quantity)
         """
         if not self._connected:
             self.last_error = "dispatch_order: PLC not connected — skipping"
@@ -610,17 +599,6 @@ class PlcClient(QThread):
         cycle.  Clearing it from Python causes a race condition where the PLC
         misses its own reset and re-fires the flag unexpectedly.
 
-        TODO (controller.py):
-            Connect client.rfid_tag_read to controller.handle_rfid_tag_read:
-                def handle_rfid_tag_read(self, data: dict) -> None:
-                    order = self.model.get_order_by_id(data["order_id"])
-                    if order:
-                        self.model.update_order_status(order.order_id, "In Progress")
-                        # record actual_start timestamp
-                    else:
-                        self.client.error.emit(
-                            f"RFID tag has unknown order_id={data['order_id']}"
-                        )
         """
         try:
             raw: list[int] = self._nodes["readData"].get_value()
@@ -646,19 +624,6 @@ class PlcClient(QThread):
         The app_done signal is emitted AFTER the PLC reset so the controller
         does not attempt to dispatch the next order before the PLC is ready.
 
-        TODO (controller.py):
-            Connect client.app_done to controller.handle_app_done:
-                def handle_app_done(self) -> None:
-                    if self._active_order_id:
-                        self.model.update_order_status(
-                            self._active_order_id, "Completed"
-                        )
-                        self.model.log_process_data(
-                            self._active_order_id, "appDone", "1", "DrillStation"
-                        )
-                        # record actual_end timestamp
-                        self._active_order_id = None
-                    self.view.populate_orders(self.model.list_orders())
         """
         try:
             # PLC handshake: clear appDone so GRAPH can advance to the idle step.
@@ -711,30 +676,3 @@ class PlcClient(QThread):
 # Integration checklist
 # ---------------------------------------------------------------------------
 #
-# mes_app.py  — TODO: wire PlcClient into the application:
-#
-#     from opcua_client import PlcClient
-#
-#     def create_app(...):
-#         ...
-#         plc = PlcClient()
-#         plc.connected.connect(lambda: view.show_message("PLC", "Connected"))
-#         plc.disconnected.connect(lambda: view.show_error("PLC", "Disconnected"))
-#         plc.error.connect(lambda msg: view.show_error("PLC Error", msg))
-#         plc.rfid_tag_read.connect(controller.handle_rfid_tag_read)
-#         plc.app_done.connect(controller.handle_app_done)
-#         plc.await_app.connect(controller.handle_await_app)
-#         app.aboutToQuit.connect(plc.stop_client)
-#         plc.start_client()
-#         return app, model, view, controller, plc
-#
-# controller.py — TODO: add these three handler methods:
-#
-#     def handle_rfid_tag_read(self, data: dict) -> None:
-#         """Look up order, mark In Progress, record actual_start."""
-#
-#     def handle_app_done(self) -> None:
-#         """Mark active order Completed, log process data, record actual_end."""
-#
-#     def handle_await_app(self) -> None:
-#         """Identify next Pending order, call client.dispatch_order()."""
