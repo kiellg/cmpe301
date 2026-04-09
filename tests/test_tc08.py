@@ -1,5 +1,3 @@
-"""TC-08 tests for MES-side OEE calculation based on persisted process_data rows."""
-
 from __future__ import annotations
 
 import pytest

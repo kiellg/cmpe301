@@ -108,7 +108,7 @@ class MesManager:
                 """
             )
 
-            # ── production_orders migrations ──────────────────────────────────
+            # production_orders migrations
             po_cols = self._table_columns(connection, "production_orders")
             if "priority" not in po_cols:
                 cursor.execute(
@@ -127,10 +127,8 @@ class MesManager:
                     "ALTER TABLE production_orders ADD COLUMN last_result TEXT"
                 )
 
-            # ── process_data migrations ───────────────────────────────────────
-            # Adds the columns needed by the new log_process_data signature.
-            # Existing rows keep NULL for new columns; NOT NULL is not required
-            # for added columns in SQLite ALTER TABLE.
+            # process_data migrations
+            # Keep older databases compatible with the current process_data schema.
             pd_cols = self._table_columns(connection, "process_data")
             if "actual_start" not in pd_cols:
                 cursor.execute(
@@ -187,7 +185,7 @@ class MesManager:
 
             connection.commit()
 
-    # ── user management ───────────────────────────────────────────────────────
+    # User management
 
     def get_user_by_username(self, username: str) -> User | None:
         normalized_username = username.strip()
@@ -297,7 +295,7 @@ class MesManager:
         self.last_error = ""
         return self.get_user_by_username(normalized_username)
 
-    # ── station management ────────────────────────────────────────────────────
+    # Station management
 
     def list_stations(self) -> list[Station]:
         with self._connect() as connection:
@@ -408,7 +406,7 @@ class MesManager:
         self.last_error = ""
         return True
 
-    # ── production order management ───────────────────────────────────────────
+    # Order management
 
     def add_order(
         self,
@@ -525,15 +523,7 @@ class MesManager:
         last_result: str | None = None,
         updated_at: str | None = None,
     ) -> bool:
-        """
-        Update the status of a production order by its integer primary key.
-
-        :param order_pk: The production_orders.id (integer PK), as returned by
-                         list_orders() as ProductionOrder.id and encoded into
-                         the RFID tag by opcua_client.encode_rfid().
-        :param status:   New status string: "Pending", "In Progress",
-                         "Completed", or "Failed".
-        """
+        """Update one production order's status and traceability fields."""
         fields: dict[str, object] = {
             "status": status,
             "updated_at": updated_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -563,7 +553,7 @@ class MesManager:
         fields["updated_at"] = updated_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
         return self._update_order_fields(order_pk, fields)
 
-    # ── process data logging ──────────────────────────────────────────────────
+    # Process data
 
     def log_process_data(
         self,
@@ -583,18 +573,7 @@ class MesManager:
         good_units: int = 0,
         defect_count: int = 0,
     ) -> None:
-        """
-        Record the result of a completed drilling cycle.
-
-        :param order_id:     production_orders.id (integer PK).
-        :param business_order_id:
-                            Human-readable order identifier entered in the MES.
-        :param station_id:   stations.id of the station that ran the job.
-        :param recipe:       Human-readable drilling recipe / pattern.
-        :param actual_start: ISO-format UTC timestamp when drilling began.
-        :param actual_end:   ISO-format UTC timestamp when drilling finished.
-        :param final_status: Final MES status for this execution attempt.
-        """
+        """Store one completed process record in the MES database."""
         logged_at = logged_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
         with self._connect() as connection:
             process_data_columns = self._table_columns(connection, "process_data")
@@ -710,7 +689,7 @@ class MesManager:
         self.last_error = ""
         return row["interval_start"], row["interval_end"]
 
-    # ── display helpers ───────────────────────────────────────────────────────
+    # Display helpers
 
     def get_logged_in_user_display(self, username: str) -> str:
         normalized_username = username.strip()
@@ -718,7 +697,7 @@ class MesManager:
             return "Logged in as: Guest"
         return f"Logged in as: {normalized_username}"
 
-    # ── private ───────────────────────────────────────────────────────────────
+    # Private helpers
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)

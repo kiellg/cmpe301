@@ -141,9 +141,7 @@ class MesController:
             self.view.show_error("Order Failed", self.model.last_error)
             return
 
-        # Keep the newly saved order as the next dispatch candidate if the PLC
-        # is not ready yet.  This avoids falling back to older seeded Pending
-        # orders when the next conv_start/awaitApp sequence arrives.
+        # Prefer the newly saved order the next time the PLC is ready.
         self._dispatch_hint_order_id = order.id
         self._maybe_preload_task_code(order)
         dispatched = self.dispatch_saved_order(order.id)

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 
-# Single tuning point for the lab OEE performance factor.
+# Ideal cycle time used for the performance factor.
 IDEAL_CYCLE_TIME_SECONDS = 20.0
 
 
