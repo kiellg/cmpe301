@@ -531,8 +531,8 @@ class MesManager:
         :param order_pk: The production_orders.id (integer PK), as returned by
                          list_orders() as ProductionOrder.id and encoded into
                          the RFID tag by opcua_client.encode_rfid().
-        :param status:   New status string such as "Pending", "Dispatched",
-                         "In Progress", "Completed", or "Failed".
+        :param status:   New status string: "Pending", "In Progress",
+                         "Completed", or "Failed".
         """
         fields: dict[str, object] = {
             "status": status,
