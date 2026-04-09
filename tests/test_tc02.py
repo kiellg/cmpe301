@@ -73,3 +73,50 @@ def test_tc02_controller_preloads_task_code_when_conv_start_fires(
     assert updated.status == "Pending"
     assert updated.last_result == "Task code 3 preloaded on conv_start"
     assert fake_view.machine_states[-1] == f"Preloaded taskCode for order {order.order_id} - {order.recipe}"
+
+
+def test_tc02_conv_start_completes_active_order_and_starts_next_order(
+    manager_factory,
+    controller_factory,
+    fake_view,
+    fake_plc_factory,
+):
+    """Verify a new pallet at conv_start closes the active order and starts the next one."""
+    model = manager_factory()
+    model.add_station("Drilling", "172.21.3.1", "", True)
+    active_order = model.add_order("PO-ACTIVE", "Left Holes", 2, "operator1", priority=2)
+    next_order = model.add_order("PO-NEXT", "All Holes", 1, "operator1", priority=1)
+    model.update_order_status(
+        active_order.id,
+        "In Progress",
+        rfid_tag=f"dbid={active_order.id};task=1;qty=2",
+        last_result="Dispatched to Siemens PLC",
+        updated_at="2026-04-08T15:00:00+00:00",
+    )
+    plc = fake_plc_factory(connected=True, conv_start=True, await_app=True, dispatch_result=True)
+    controller = controller_factory(model, view=fake_view, plc=plc)
+    controller._active_order = {
+        "db_id": active_order.id,
+        "order_id": active_order.order_id,
+        "recipe": active_order.recipe,
+        "quantity": active_order.quantity,
+        "task_code": RECIPE_TASK_CODES["Left Holes"],
+        "start": "2026-04-08T15:00:00+00:00",
+        "rfid_tag": f"dbid={active_order.id};task=1;qty=2",
+    }
+
+    controller.handle_conv_start()
+
+    completed = model.get_order_by_id(active_order.id)
+    started = model.get_order_by_id(next_order.id)
+    history = model.list_process_data(active_order.id)
+
+    assert completed is not None
+    assert completed.status == "Completed"
+    assert completed.last_result == "Completed on conv_start handoff"
+    assert history[0]["final_status"] == "Completed"
+    assert history[0]["result_message"] == "Completed when next pallet reached conv_start (demo handoff)"
+    assert started is not None
+    assert started.status == "In Progress"
+    assert plc.dispatch_calls == [(next_order.id, RECIPE_TASK_CODES["All Holes"], 1)]
+    assert controller._active_order["db_id"] == next_order.id

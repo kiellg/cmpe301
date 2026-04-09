@@ -229,10 +229,17 @@ class MesController:
 
     def handle_conv_start(self) -> None:
         if self._active_order is not None:
-            self.view.append_plc_log(
-                f"conv_start fired while order {self._active_order['order_id']} is already active"
+            completed_order_label = self._active_order["order_id"]
+            self._complete_active_order(
+                last_result="Completed on conv_start handoff",
+                result_message="Completed when next pallet reached conv_start (demo handoff)",
             )
-            return
+            self.view.update_machine_state(
+                f"Completed order {completed_order_label} on conv_start handoff"
+            )
+            self.view.append_plc_log(
+                f"conv_start: marked order {completed_order_label} completed on next pallet arrival"
+            )
 
         order = self._next_dispatchable_order()
         if order is None:
@@ -240,7 +247,11 @@ class MesController:
             self.view.append_plc_log("conv_start fired but no pending orders are ready")
             return
 
-        if self._maybe_preload_task_code(order):
+        preloaded = self._maybe_preload_task_code(order)
+        if bool(self.plc_client.read_node("awaitApp")):
+            self.dispatch_saved_order(order.id)
+            return
+        if preloaded:
             self.view.update_machine_state(
                 f"Preloaded taskCode for order {order.order_id} - {order.recipe}"
             )
@@ -266,44 +277,17 @@ class MesController:
             return
 
         try:
-            completed_at = self._utc_now()
-            order_id = self._active_order["db_id"]
             order_label = self._active_order["order_id"]
-            recipe = self._active_order["recipe"]
-            quantity = self._active_order["quantity"]
-            rfid_tag = self._active_order["rfid_tag"]
-
-            self.model.update_order_status(
-                order_id,
-                "Completed",
-                rfid_tag=rfid_tag,
+            self._complete_active_order(
                 last_result="Completed at drilling station",
-                updated_at=completed_at,
-            )
-            self.model.log_process_data(
-                order_id=order_id,
-                business_order_id=order_label,
-                station_id=self._default_station_id(),
-                recipe=recipe,
-                actual_start=self._active_order["start"],
-                actual_end=completed_at,
-                final_status="Completed",
-                rfid_tag=rfid_tag,
                 result_message="PLC appDone received",
-                cycle_complete=True,
-                good_units=quantity,
-                defect_count=0,
             )
-
-            self._refresh_orders()
             self.view.update_machine_state("Completed - ready for next carrier")
             self.view.append_plc_log(
-                f"Order {order_label} completed at {completed_at}"
+                f"Order {order_label} completed via PLC appDone"
             )
         except Exception as exc:  # noqa: BLE001
             print(f"log_process_data error: {exc}", file=sys.stderr)
-        finally:
-            self.close_active_order()
 
     def handle_plc_error(self, message: str) -> None:
         print(f"[PLC ERROR] {message}", file=sys.stderr)
@@ -418,6 +402,42 @@ class MesController:
             defect_count=0,
         )
         self._refresh_orders()
+
+    def _complete_active_order(
+        self,
+        *,
+        last_result: str,
+        result_message: str,
+    ) -> bool:
+        if self._active_order is None:
+            return False
+
+        completed_at = self._utc_now()
+        active_order = dict(self._active_order)
+        self.model.update_order_status(
+            active_order["db_id"],
+            "Completed",
+            rfid_tag=active_order["rfid_tag"],
+            last_result=last_result,
+            updated_at=completed_at,
+        )
+        self.model.log_process_data(
+            order_id=active_order["db_id"],
+            business_order_id=active_order["order_id"],
+            station_id=self._default_station_id(),
+            recipe=active_order["recipe"],
+            actual_start=active_order["start"],
+            actual_end=completed_at,
+            final_status="Completed",
+            rfid_tag=active_order["rfid_tag"],
+            result_message=result_message,
+            cycle_complete=True,
+            good_units=active_order["quantity"],
+            defect_count=0,
+        )
+        self.close_active_order()
+        self._refresh_orders()
+        return True
 
     def _maybe_preload_task_code(self, order: ProductionOrder) -> bool:
         if not self.plc_client.is_connected:
