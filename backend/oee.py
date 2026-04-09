@@ -5,7 +5,7 @@ from datetime import datetime
 
 
 # Single tuning point for the lab OEE performance factor.
-IDEAL_CYCLE_TIME_SECONDS = 60.0
+IDEAL_CYCLE_TIME_SECONDS = 20.0
 
 
 @dataclass(frozen=True)
