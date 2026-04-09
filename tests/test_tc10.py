@@ -5,50 +5,21 @@ from __future__ import annotations
 from opcua_client import PlcClient
 
 
-class _SequencedBoolNode:
-    """Minimal fake OPC UA node that returns a scripted sequence of boolean values."""
-
-    def __init__(self, values: list[bool]) -> None:
-        self._values = list(values)
-        self._index = 0
-
-    def get_value(self) -> bool:
-        if self._index >= len(self._values):
-            return self._values[-1]
-        value = self._values[self._index]
-        self._index += 1
-        return value
-
-
-class _ResolvableNode:
-    """Fake OPC UA node that either validates or raises a configured exception."""
-
-    def __init__(self, error: Exception | None = None) -> None:
-        self._error = error
-
-    def get_data_type_as_variant_type(self) -> str:
-        if self._error is not None:
-            raise self._error
-        return "Boolean"
-
-
-def test_tc10_controller_keeps_active_order_non_failed_on_simulated_plc_error(
+def test_tc10_controller_marks_active_order_failed_on_simulated_plc_error(
     manager_factory,
     controller_factory,
     fake_view,
 ):
-    """Verify controller error handling logs the issue without auto-failing the active order."""
+    """Verify controller error handling marks the active order failed and logs history."""
     model = manager_factory()
     model.add_station("Drilling", "172.21.3.1", "", True)
     order = model.add_order("PO-FAIL", "Left Holes", 2, "operator1", priority=1)
-    model.update_order_status(order.id, "In Progress", last_result="conv_start received from PLC")
     controller = controller_factory(model, view=fake_view)
     controller._active_order = {
         "db_id": order.id,
         "order_id": order.order_id,
         "recipe": order.recipe,
         "quantity": order.quantity,
-        "started": True,
         "start": "2026-04-08T12:00:00+00:00",
         "rfid_tag": f"dbid={order.id};task=1;qty=2",
     }
@@ -58,11 +29,12 @@ def test_tc10_controller_keeps_active_order_non_failed_on_simulated_plc_error(
     updated = model.get_order_by_id(order.id)
     history = model.list_process_data(order.id)
     assert updated is not None
-    assert updated.status == "In Progress"
+    assert updated.status == "Failed"
     assert updated.last_result == "dispatch_order: writeDone timeout after 5s"
-    assert controller._active_order is not None
-    assert history == []
-    assert fake_view.machine_states[-1].startswith("PLC error:")
+    assert controller._active_order is None
+    assert history[0]["final_status"] == "Failed"
+    assert history[0]["fault_code"] == "dispatch_order: writeDone timeout after 5s"
+    assert fake_view.machine_states[-1] == "Execution failed - see PLC log"
 
 
 def test_tc10_plc_client_run_emits_reconnect_error_when_connect_fails(monkeypatch):
@@ -83,54 +55,3 @@ def test_tc10_plc_client_run_emits_reconnect_error_when_connect_fails(monkeypatc
 
     assert cleanup_calls == ["cleanup", "cleanup"]
     assert any("PLC connection error: boom" in message for message in errors)
-
-
-def test_tc10_resolve_node_falls_back_to_global_plc_tag_when_db_path_is_missing():
-    """Verify the OPC UA client accepts a global PLC tag path when the DB path does not exist."""
-    plc = PlcClient()
-    bad_node_error = RuntimeError("BadNodeIdUnknown")
-
-    class FakeClient:
-        def get_node(self, ref: str) -> _ResolvableNode:
-            if ref.endswith('s="abstractMachine"."conv_end"'):
-                return _ResolvableNode(bad_node_error)
-            if ref.endswith('s="conv_end"'):
-                return _ResolvableNode()
-            raise AssertionError(f"Unexpected node lookup: {ref}")
-
-    node = plc._resolve_node(
-        FakeClient(),
-        3,
-        "conv_end",
-        ('"abstractMachine"."conv_end"', '"conv_end"'),
-    )
-
-    assert isinstance(node, _ResolvableNode)
-
-
-def test_tc10_poll_loop_recovers_missed_conv_end_subscription(monkeypatch):
-    """Verify fallback polling emits conv_end when the PLC end tag changes without a subscription event."""
-    plc = PlcClient()
-    completions: list[str] = []
-    sleep_calls = {"count": 0}
-
-    plc._nodes = {
-        "appDone": _SequencedBoolNode([False, False]),
-        "awaitApp": _SequencedBoolNode([False, False]),
-        "conv_start": _SequencedBoolNode([False, False]),
-        "conv_end": _SequencedBoolNode([False, True]),
-        "readDone": _SequencedBoolNode([False, False]),
-        "readPresence": _SequencedBoolNode([False, False]),
-    }
-    plc.conv_end.connect(lambda: completions.append("done"))
-
-    def fake_sleep(_seconds: float) -> None:
-        sleep_calls["count"] += 1
-        if sleep_calls["count"] >= 2:
-            plc._stop_event.set()
-
-    monkeypatch.setattr("opcua_client.time.sleep", fake_sleep)
-
-    plc._poll_loop()
-
-    assert completions == ["done"]

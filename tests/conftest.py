@@ -25,6 +25,8 @@ class FakeView:
         self.order_snapshots: list[list[object]] = []
         self.station_snapshots: list[list[object]] = []
         self.cleared_order_form = False
+        self.oee_updates: list[dict[str, object]] = []
+        self.oee_unavailable: list[str] = []
 
     def show_message(self, title: str, message: str) -> None:
         self.messages.append((title, message))
@@ -47,17 +49,39 @@ class FakeView:
     def append_plc_log(self, message: str) -> None:
         self.logs.append(message)
 
+    def update_oee(
+        self,
+        availability: float,
+        performance: float,
+        quality: float,
+        *,
+        detail_text: str | None = None,
+    ) -> None:
+        self.oee_updates.append(
+            {
+                "availability": availability,
+                "performance": performance,
+                "quality": quality,
+                "detail_text": detail_text,
+            }
+        )
+
+    def show_oee_unavailable(self, message: str) -> None:
+        self.oee_unavailable.append(message)
+
 
 class FakePlc:
     def __init__(
         self,
         *,
         connected: bool = False,
+        conv_start: bool = False,
         await_app: bool = False,
         dispatch_result: bool = True,
         last_error: str = "",
     ) -> None:
         self.is_connected = connected
+        self.conv_start = conv_start
         self.await_app = await_app
         self.dispatch_result = dispatch_result
         self.last_error = last_error
@@ -67,6 +91,8 @@ class FakePlc:
 
     def read_node(self, alias: str) -> object:
         self.read_calls.append(alias)
+        if alias == "conv_start":
+            return self.conv_start
         if alias == "awaitApp":
             return self.await_app
         return None

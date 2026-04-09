@@ -9,7 +9,7 @@ Architecture overview
 PlcClient (QThread)
   └─ run()                        ← worker thread entry
        ├─ _connect()              ← builds node map, registers subscriptions
-       ├─ _poll_loop()            ← 100 ms fallback poll for workflow booleans
+       ├─ _poll_loop()            ← 100 ms idle loop; subscriptions drive live events
        └─ _cleanup()              ← tears down subscription + disconnects
 
 OpcUaSubscriptionHandler          ← opcua library callback, routes to PlcClient signals
@@ -53,18 +53,16 @@ BACKOFF_MAX_S  = 30.0
 # ---------------------------------------------------------------------------
 # OPC UA node path table
 # All paths are relative to the Siemens namespace; keys are the aliases used
-# throughout this module. Some aliases try multiple symbolic paths to support
-# either global PLC tags or DB-backed variables.
+# throughout this module.
 # ---------------------------------------------------------------------------
 
-NODE_PATHS: dict[str, str | tuple[str, ...]] = {
+NODE_PATHS: dict[str, str] = {
+    "conv_start": '"conv_start"',
     # abstractMachine [DB1] — GRAPH sequence control
     "taskCode":   '"abstractMachine"."taskCode"',   # Byte  — TCP byte 0 to Festo CECC
     "awaitApp":   '"abstractMachine"."awaitApp"',   # Bool  — PLC waiting for MES command
-    "appRun":     '"abstractMachine"."appRun"',     # Bool  — MES sets True to arm the cycle
-    "appDone":    '"abstractMachine"."appDone"',    # Bool  — PLC done flag (monitored only)
-    "conv_start": ('"conv_start"', 'conv_start', '"abstractMachine"."conv_start"'),
-    "conv_end":   ('"conv_end"', 'conv_end', '"abstractMachine"."conv_end"'),
+    "appRun":     '"abstractMachine"."appRun"',     # Bool  — MES sets True to start cycle
+    "appDone":    '"abstractMachine"."appDone"',    # Bool  — PLC sets True when done
     "sendTCPcmd": '"abstractMachine"."sendTCPcmd"', # Bool  — triggers 2-byte TCP frame
     "drillDone":  '"abstractMachine"."drillDone"',  # Bool  — drilling op complete
     "release":    '"abstractMachine"."release"',    # Bool  — release / reset
@@ -82,14 +80,13 @@ NODE_PATHS: dict[str, str | tuple[str, ...]] = {
     "writeData": '"identData"."writeData"',         # Array[0..31] of Byte
 }
 
-# Nodes that drive the MES workflow. OPC UA subscriptions are the primary event
-# path, and _poll_loop() re-reads these aliases as a fallback in case a
-# subscription notification is missed.
+# Nodes that the OPC UA subscription monitors for event-driven callbacks.
+# The current event flow depends on these subscriptions; _poll_loop() is idle
+# until periodic reads are added there.
 SUBSCRIBED_ALIASES: frozenset[str] = frozenset({
     "appDone",
-    "awaitApp",
     "conv_start",
-    "conv_end",
+    "awaitApp",
     "readDone",
     "readPresence",
 })
@@ -173,11 +170,12 @@ class OpcUaSubscriptionHandler:
     Implements the opcua SubHandler interface.
 
     The opcua library calls datachange_notification() from its own internal
-    subscription thread whenever a monitored node value changes. This class
-    routes those raw callbacks through PlcClient so subscriptions and fallback
-    polling share the same rising-edge handling logic.
+    subscription thread whenever a monitored node value changes.  This class
+    translates those raw callbacks into PlcClient method calls, which in turn
+    emit Qt signals.  Qt signals are thread-safe, so emitting them from the
+    subscription thread is correct.
 
-    Subscribed nodes: appDone, awaitApp, conv_start, conv_end, readDone, readPresence.
+    Subscribed nodes: appDone, conv_start, awaitApp, readDone, readPresence.
     """
 
     def __init__(self, plc_client: "PlcClient") -> None:
@@ -196,7 +194,25 @@ class OpcUaSubscriptionHandler:
             if alias is None:
                 return  # Not a tracked node — ignore
 
-            self._plc._handle_observed_alias(alias, val)
+            # Always emit generic data_changed so the GUI can display live values
+            self._plc.data_changed.emit(alias, val)
+
+            # Specific handlers for nodes that drive the production workflow.
+            # Only act on rising edges (True) to avoid double-triggering.
+            if alias == "appDone" and bool(val):
+                # PLC finished drilling cycle → reset PLC flag, notify controller
+                self._plc._on_app_done()
+
+            elif alias == "conv_start" and bool(val):
+                self._plc.conv_start.emit()
+
+            elif alias == "awaitApp" and bool(val):
+                # PLC stepped into the "await MES command" GRAPH state
+                self._plc.await_app.emit()
+
+            elif alias == "readDone" and bool(val):
+                # RF210R finished reading RFID tag → decode and emit rfid_tag_read
+                self._plc._on_rfid_read_done()
 
         except Exception as exc:  # noqa: BLE001
             self._plc.error.emit(f"Subscription handler exception: {exc}")
@@ -214,8 +230,8 @@ class PlcClient(QThread):
     OPC UA client for the Siemens S7-1512SP PLC, running in a QThread.
 
     The worker thread (run()) connects to the PLC, sets up subscriptions, and
-    runs a lightweight background loop. Subscriptions are the primary source of
-    live updates, and the loop re-reads key workflow booleans as a fallback.
+    runs a lightweight background loop.  Live node-change handling currently
+    comes from subscriptions; the loop is a placeholder for periodic reads.
     GUI-thread code interacts with the PLC exclusively through:
       - Qt signals (received events from the PLC)
       - write_node() / read_node() / dispatch_order() (commands to the PLC)
@@ -225,8 +241,8 @@ class PlcClient(QThread):
     connected        Emitted once after a successful OPC UA connect.
     disconnected     Emitted when the connection is lost or stop_client() called.
     rfid_tag_read    Emitted with parsed RFID payload when readDone fires.
-    conv_start       Emitted when the PLC raises the conveyor start tag.
-    conv_end         Emitted when the PLC raises the conveyor end tag.
+    app_done         Emitted after the drilling cycle completes (appDone → True).
+    conv_start       Emitted when the PLC raises the conveyor/start dispatch trigger.
     await_app        Emitted when the PLC enters the "await MES" GRAPH state.
     data_changed     Emitted for every subscribed node value change (node alias, value).
     error            Emitted with a human-readable message on any fault.
@@ -245,8 +261,8 @@ class PlcClient(QThread):
     connected:     pyqtSignal = pyqtSignal()
     disconnected:  pyqtSignal = pyqtSignal()
     rfid_tag_read: pyqtSignal = pyqtSignal(dict)    # {"order_id": int, "task_code": int, "quantity": int}
+    app_done:      pyqtSignal = pyqtSignal()
     conv_start:    pyqtSignal = pyqtSignal()
-    conv_end:      pyqtSignal = pyqtSignal()
     await_app:     pyqtSignal = pyqtSignal()
     data_changed:  pyqtSignal = pyqtSignal(str, object)  # (node_alias, new_value)
     error:         pyqtSignal = pyqtSignal(str)
@@ -266,11 +282,6 @@ class PlcClient(QThread):
         # Protects dispatch_order() against concurrent calls from the GUI thread
         # and avoids interleaving writes with subscription callbacks.
         self._write_lock = threading.Lock()
-
-        # Tracks the last observed value for subscription-backed workflow nodes
-        # so subscriptions and fallback polling share one rising-edge gate.
-        self._observed_lock = threading.Lock()
-        self._observed_values: dict[str, bool] = {}
 
         # Set by stop_client() to break the poll loop and reconnect loop
         self._stop_event = threading.Event()
@@ -315,8 +326,7 @@ class PlcClient(QThread):
           2. writeData  ← Serialize order into 32-byte RFID payload (DB2).
           3. doWrite    ← Trigger RF210R IO-Link write to the physical RFID tag.
           4. writeDone  ← Poll until PLC confirms write (or 5 s timeout).
-          5. appRun     ← Kick the GRAPH sequence; the PLC then raises conv_start
-                           and conv_end as the station enters and leaves execution.
+          5. appRun     ← Kick the GRAPH sequence; PLC sends TCP frame to Festo.
 
         :param order_id:  Numeric order identifier.  Must fit in uint32.
         :param task_code: Recipe code 0-3 from RECIPE_TASK_CODES.
@@ -381,7 +391,7 @@ class PlcClient(QThread):
                 # Only reached if taskCode and RFID write both succeeded.
                 # The PLC GRAPH transitions to the drilling state, fires
                 # sendTCPcmd to the Festo CECC (2-byte frame: taskCode, 0x01),
-                # and later raises conv_start / conv_end as execution progresses.
+                # and eventually sets appDone=True when complete.
                 self._write_node("appRun", True)
                 logger.info(
                     "Step 5 OK appRun=True — drilling started "
@@ -497,7 +507,7 @@ class PlcClient(QThread):
         nodes: dict[str, object] = {}
         nid_map: dict[object, str] = {}
         for alias, path in NODE_PATHS.items():
-            node = self._resolve_node(client, idx, alias, path)
+            node = client.get_node(f"ns={idx};s={path}")
             nodes[alias] = node
             nid_map[node.nodeid] = alias
 
@@ -522,14 +532,9 @@ class PlcClient(QThread):
         # Reset control flags to known-good state.
         # A prior session crash may have left stale True values on the PLC.
         self._write_node("appRun",  False)
+        self._write_node("appDone", False)
         self._write_node("doWrite", False)
         logger.debug("Control flags reset to False")
-
-        with self._observed_lock:
-            self._observed_values = {
-                alias: self._read_bool(alias)
-                for alias in SUBSCRIBED_ALIASES
-            }
 
         self.connected.emit()
 
@@ -537,20 +542,22 @@ class PlcClient(QThread):
         """
         100 ms background loop.  Runs after a successful _connect().
 
-        OPC UA subscriptions remain the primary event path. This loop re-reads
-        the key workflow booleans so the MES still reacts if a subscription
-        notification is missed.
+        The OPC UA subscription is the only active notification path for
+        appDone, conv_start, awaitApp, readDone, and readPresence in the current code.
+        This loop is intentionally idle until periodic reads are added here.
+
+        Additional periodic reads (for example drillDone or machine mode
+        display) can be added here without touching the subscription handler.
 
         Exits when _stop_event is set or an unhandled exception propagates
         (causing run() to catch it and attempt reconnection).
         """
         logger.debug("Poll loop started")
         while not self._stop_event.is_set():
-            for alias in SUBSCRIBED_ALIASES:
-                node = self._nodes.get(alias)
-                if node is None:
-                    raise KeyError(f"_poll_loop: missing node for alias {alias!r}")
-                self._handle_observed_alias(alias, node.get_value())
+            # Subscription handles primary event flow — poll is a backstop only.
+            # Add periodic reads here as needed, e.g.:
+            #   drill_done = self._read_bool("drillDone")
+            #   self.data_changed.emit("drillDone", drill_done)
             time.sleep(POLL_INTERVAL_S)
         logger.debug("Poll loop exited")
 
@@ -579,8 +586,6 @@ class PlcClient(QThread):
 
         self._nodes.clear()
         self._node_id_to_alias.clear()
-        with self._observed_lock:
-            self._observed_values.clear()
 
         if was_connected:
             self.disconnected.emit()
@@ -589,34 +594,6 @@ class PlcClient(QThread):
     # ------------------------------------------------------------------
     # Subscription callback handlers (called from opcua subscription thread)
     # ------------------------------------------------------------------
-
-    def _resolve_node(
-        self,
-        client: Client,
-        namespace_index: int,
-        alias: str,
-        path_spec: str | tuple[str, ...],
-    ) -> object:
-        """
-        Resolve a symbolic node path and validate that it exists in the OPC UA
-        server address space before storing it in the live node map.
-        """
-        candidates = (path_spec,) if isinstance(path_spec, str) else path_spec
-        last_error: Exception | None = None
-
-        for candidate in candidates:
-            node = client.get_node(f"ns={namespace_index};s={candidate}")
-            try:
-                node.get_data_type_as_variant_type()
-                if len(candidates) > 1:
-                    logger.info("Resolved %s using OPC UA path %s", alias, candidate)
-                return node
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-
-        if last_error is not None:
-            raise last_error
-        raise KeyError(f"No OPC UA path candidates configured for alias {alias!r}")
 
     def _on_rfid_read_done(self) -> None:
         """
@@ -644,63 +621,27 @@ class PlcClient(QThread):
         except Exception as exc:  # noqa: BLE001
             self.error.emit(f"_on_rfid_read_done error: {exc}")
 
-    def _on_conv_start(self) -> None:
+    def _on_app_done(self) -> None:
         """
-        Handle the conv_start → True transition by notifying the controller.
-        """
-        try:
-            logger.info("conv_start observed, emitting conv_start signal")
-            self.conv_start.emit()
+        Handle the appDone → True transition.
 
-        except Exception as exc:  # noqa: BLE001
-            self.error.emit(f"_on_conv_start error: {exc}")
+        Resets appDone=False on the PLC before emitting app_done.  The GRAPH
+        sequence waits in the "appDone" step until the flag is cleared; if the
+        MES does not clear it, the PLC stalls and cannot accept the next job.
 
-    def _on_conv_end(self) -> None:
-        """
-        Handle the conv_end → True transition by notifying the controller.
+        The app_done signal is emitted AFTER the PLC reset so the controller
+        does not attempt to dispatch the next order before the PLC is ready.
+
         """
         try:
-            logger.info("conv_end observed, emitting conv_end signal")
-            self.conv_end.emit()
+            # PLC handshake: clear appDone so GRAPH can advance to the idle step.
+            # This MUST happen before the controller dispatches the next order.
+            self._write_node("appDone", False)
+            logger.info("appDone cleared on PLC, emitting app_done signal")
+            self.app_done.emit()
 
         except Exception as exc:  # noqa: BLE001
-            self.error.emit(f"_on_conv_end error: {exc}")
-
-    def _handle_observed_alias(self, alias: str, value: object) -> None:
-        """
-        Process a workflow alias observed from either subscriptions or fallback
-        polling, emitting signals only on value changes and firing workflow
-        handlers on rising edges.
-        """
-        observed_value = bool(value)
-        should_emit_data_changed = False
-        should_emit_await_app = False
-        should_handle_conv_start = False
-        should_handle_conv_end = False
-        should_handle_rfid_read = False
-
-        with self._observed_lock:
-            previous = self._observed_values.get(alias)
-            if previous is None or previous != observed_value:
-                self._observed_values[alias] = observed_value
-                should_emit_data_changed = True
-
-                if observed_value:
-                    should_emit_await_app = alias == "awaitApp"
-                    should_handle_conv_start = alias == "conv_start"
-                    should_handle_conv_end = alias == "conv_end"
-                    should_handle_rfid_read = alias == "readDone"
-
-        if should_emit_data_changed:
-            self.data_changed.emit(alias, observed_value)
-        if should_emit_await_app:
-            self.await_app.emit()
-        if should_handle_conv_start:
-            self._on_conv_start()
-        if should_handle_conv_end:
-            self._on_conv_end()
-        if should_handle_rfid_read:
-            self._on_rfid_read_done()
+            self.error.emit(f"_on_app_done error: {exc}")
 
     # ------------------------------------------------------------------
     # Low-level node I/O (no error handling — callers must handle exceptions)
@@ -737,3 +678,4 @@ class PlcClient(QThread):
             return bool(node.get_value()) if node is not None else False
         except Exception:  # noqa: BLE001
             return False
+

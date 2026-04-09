@@ -531,8 +531,8 @@ class MesManager:
         :param order_pk: The production_orders.id (integer PK), as returned by
                          list_orders() as ProductionOrder.id and encoded into
                          the RFID tag by opcua_client.encode_rfid().
-        :param status:   New status string such as "Pending", "Dispatched",
-                         "In Progress", "Completed", or "Failed".
+        :param status:   New status string: "Pending", "In Progress",
+                         "Completed", or "Failed".
         """
         fields: dict[str, object] = {
             "status": status,
@@ -636,28 +636,7 @@ class MesManager:
 
     def list_process_data(self, order_id: int | None = None) -> list[dict]:
         with self._connect() as connection:
-            process_data_columns = self._table_columns(connection, "process_data")
-            select_columns = [
-                column
-                for column in [
-                    "id",
-                    "order_id",
-                    "business_order_id",
-                    "station_id",
-                    "recipe",
-                    "rfid_tag",
-                    "actual_start",
-                    "actual_end",
-                    "final_status",
-                    "result_message",
-                    "fault_code",
-                    "cycle_complete",
-                    "logged_at",
-                    "good_units",
-                    "defect_count",
-                ]
-                if column in process_data_columns
-            ]
+            select_columns = self._process_data_select_columns(connection)
             sql = f"SELECT {', '.join(select_columns)} FROM process_data"
             parameters: tuple[object, ...] = ()
             if order_id is not None:
@@ -668,6 +647,68 @@ class MesManager:
 
         self.last_error = ""
         return [dict(row) for row in rows]
+
+    def list_process_data_for_interval(
+        self,
+        interval_start: str,
+        interval_end: str,
+        *,
+        order_id: int | None = None,
+    ) -> list[dict]:
+        with self._connect() as connection:
+            process_data_columns = self._table_columns(connection, "process_data")
+            select_columns = self._process_data_select_columns(connection)
+            record_start = self._process_data_time_expression(
+                process_data_columns,
+                ("actual_start", "logged_at", "actual_end"),
+            )
+            record_end = self._process_data_time_expression(
+                process_data_columns,
+                ("actual_end", "logged_at", "actual_start"),
+            )
+            if record_start is None or record_end is None:
+                return self.list_process_data(order_id=order_id)
+
+            sql = f"SELECT {', '.join(select_columns)} FROM process_data WHERE {record_end} >= ? AND {record_start} <= ?"
+            parameters: list[object] = [interval_start, interval_end]
+            if order_id is not None:
+                sql += " AND order_id = ?"
+                parameters.append(order_id)
+            sql += " ORDER BY id DESC"
+            rows = connection.execute(sql, tuple(parameters)).fetchall()
+
+        self.last_error = ""
+        return [dict(row) for row in rows]
+
+    def get_process_data_interval_bounds(self) -> tuple[str, str] | None:
+        with self._connect() as connection:
+            process_data_columns = self._table_columns(connection, "process_data")
+            record_start = self._process_data_time_expression(
+                process_data_columns,
+                ("actual_start", "logged_at", "actual_end"),
+            )
+            record_end = self._process_data_time_expression(
+                process_data_columns,
+                ("actual_end", "logged_at", "actual_start"),
+            )
+            if record_start is None or record_end is None:
+                self.last_error = ""
+                return None
+
+            row = connection.execute(
+                f"""
+                SELECT MIN({record_start}) AS interval_start,
+                       MAX({record_end}) AS interval_end
+                FROM process_data
+                """
+            ).fetchone()
+
+        if row is None or row["interval_start"] is None or row["interval_end"] is None:
+            self.last_error = ""
+            return None
+
+        self.last_error = ""
+        return row["interval_start"], row["interval_end"]
 
     # ── display helpers ───────────────────────────────────────────────────────
 
@@ -704,6 +745,42 @@ class MesManager:
     @staticmethod
     def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
         return {row["name"] for row in connection.execute(f"PRAGMA table_info({table_name})")}
+
+    def _process_data_select_columns(self, connection: sqlite3.Connection) -> list[str]:
+        process_data_columns = self._table_columns(connection, "process_data")
+        return [
+            column
+            for column in [
+                "id",
+                "order_id",
+                "business_order_id",
+                "station_id",
+                "recipe",
+                "rfid_tag",
+                "actual_start",
+                "actual_end",
+                "final_status",
+                "result_message",
+                "fault_code",
+                "cycle_complete",
+                "logged_at",
+                "good_units",
+                "defect_count",
+            ]
+            if column in process_data_columns
+        ]
+
+    @staticmethod
+    def _process_data_time_expression(
+        process_data_columns: set[str],
+        column_priority: tuple[str, ...],
+    ) -> str | None:
+        available = [column for column in column_priority if column in process_data_columns]
+        if not available:
+            return None
+        if len(available) == 1:
+            return available[0]
+        return f"COALESCE({', '.join(available)})"
 
     def _username_exists(self, username: str) -> bool:
         with self._connect() as connection:
