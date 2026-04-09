@@ -20,6 +20,18 @@ class _SequencedBoolNode:
         return value
 
 
+class _ResolvableNode:
+    """Fake OPC UA node that either validates or raises a configured exception."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self._error = error
+
+    def get_data_type_as_variant_type(self) -> str:
+        if self._error is not None:
+            raise self._error
+        return "Boolean"
+
+
 def test_tc10_controller_keeps_active_order_non_failed_on_simulated_plc_error(
     manager_factory,
     controller_factory,
@@ -71,6 +83,29 @@ def test_tc10_plc_client_run_emits_reconnect_error_when_connect_fails(monkeypatc
 
     assert cleanup_calls == ["cleanup", "cleanup"]
     assert any("PLC connection error: boom" in message for message in errors)
+
+
+def test_tc10_resolve_node_falls_back_to_global_plc_tag_when_db_path_is_missing():
+    """Verify the OPC UA client accepts a global PLC tag path when the DB path does not exist."""
+    plc = PlcClient()
+    bad_node_error = RuntimeError("BadNodeIdUnknown")
+
+    class FakeClient:
+        def get_node(self, ref: str) -> _ResolvableNode:
+            if ref.endswith('s="abstractMachine"."conv_end"'):
+                return _ResolvableNode(bad_node_error)
+            if ref.endswith('s="conv_end"'):
+                return _ResolvableNode()
+            raise AssertionError(f"Unexpected node lookup: {ref}")
+
+    node = plc._resolve_node(
+        FakeClient(),
+        3,
+        "conv_end",
+        ('"abstractMachine"."conv_end"', '"conv_end"'),
+    )
+
+    assert isinstance(node, _ResolvableNode)
 
 
 def test_tc10_poll_loop_recovers_missed_conv_end_subscription(monkeypatch):

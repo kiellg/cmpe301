@@ -53,17 +53,18 @@ BACKOFF_MAX_S  = 30.0
 # ---------------------------------------------------------------------------
 # OPC UA node path table
 # All paths are relative to the Siemens namespace; keys are the aliases used
-# throughout this module.
+# throughout this module. Some aliases try multiple symbolic paths to support
+# either global PLC tags or DB-backed variables.
 # ---------------------------------------------------------------------------
 
-NODE_PATHS: dict[str, str] = {
+NODE_PATHS: dict[str, str | tuple[str, ...]] = {
     # abstractMachine [DB1] — GRAPH sequence control
     "taskCode":   '"abstractMachine"."taskCode"',   # Byte  — TCP byte 0 to Festo CECC
     "awaitApp":   '"abstractMachine"."awaitApp"',   # Bool  — PLC waiting for MES command
     "appRun":     '"abstractMachine"."appRun"',     # Bool  — MES sets True to arm the cycle
     "appDone":    '"abstractMachine"."appDone"',    # Bool  — PLC done flag (monitored only)
-    "conv_start": '"abstractMachine"."conv_start"', # Bool  — conveyor/cycle start reached
-    "conv_end":   '"abstractMachine"."conv_end"',   # Bool  — conveyor/cycle end reached
+    "conv_start": ('"conv_start"', 'conv_start', '"abstractMachine"."conv_start"'),
+    "conv_end":   ('"conv_end"', 'conv_end', '"abstractMachine"."conv_end"'),
     "sendTCPcmd": '"abstractMachine"."sendTCPcmd"', # Bool  — triggers 2-byte TCP frame
     "drillDone":  '"abstractMachine"."drillDone"',  # Bool  — drilling op complete
     "release":    '"abstractMachine"."release"',    # Bool  — release / reset
@@ -496,7 +497,7 @@ class PlcClient(QThread):
         nodes: dict[str, object] = {}
         nid_map: dict[object, str] = {}
         for alias, path in NODE_PATHS.items():
-            node = client.get_node(f"ns={idx};s={path}")
+            node = self._resolve_node(client, idx, alias, path)
             nodes[alias] = node
             nid_map[node.nodeid] = alias
 
@@ -588,6 +589,34 @@ class PlcClient(QThread):
     # ------------------------------------------------------------------
     # Subscription callback handlers (called from opcua subscription thread)
     # ------------------------------------------------------------------
+
+    def _resolve_node(
+        self,
+        client: Client,
+        namespace_index: int,
+        alias: str,
+        path_spec: str | tuple[str, ...],
+    ) -> object:
+        """
+        Resolve a symbolic node path and validate that it exists in the OPC UA
+        server address space before storing it in the live node map.
+        """
+        candidates = (path_spec,) if isinstance(path_spec, str) else path_spec
+        last_error: Exception | None = None
+
+        for candidate in candidates:
+            node = client.get_node(f"ns={namespace_index};s={candidate}")
+            try:
+                node.get_data_type_as_variant_type()
+                if len(candidates) > 1:
+                    logger.info("Resolved %s using OPC UA path %s", alias, candidate)
+                return node
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+
+        if last_error is not None:
+            raise last_error
+        raise KeyError(f"No OPC UA path candidates configured for alias {alias!r}")
 
     def _on_rfid_read_done(self) -> None:
         """
