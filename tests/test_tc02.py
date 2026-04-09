@@ -49,3 +49,27 @@ def test_tc02_controller_dispatches_saved_order_with_simulated_plc(
     assert updated.last_result == "Dispatched to Siemens PLC"
     assert controller._active_order["task_code"] == 2
     assert fake_view.machine_states[-1] == f"Dispatched order {order.order_id} - {order.recipe}"
+
+
+def test_tc02_controller_preloads_task_code_when_conv_start_fires(
+    manager_factory,
+    controller_factory,
+    fake_view,
+    fake_plc_factory,
+):
+    """Verify conv_start rising edge preloads the next pending order task code."""
+    model = manager_factory()
+    order = model.add_order("PO-2002", "All Holes", 3, "operator1", priority=2)
+    plc = fake_plc_factory(connected=True, conv_start=True, await_app=False, dispatch_result=True)
+    controller = controller_factory(model, view=fake_view, plc=plc)
+
+    controller.handle_conv_start()
+
+    updated = model.get_order_by_id(order.id)
+
+    assert plc.dispatch_calls == []
+    assert plc.write_calls == [("taskCode", RECIPE_TASK_CODES["All Holes"])]
+    assert updated is not None
+    assert updated.status == "Pending"
+    assert updated.last_result == "Task code 3 preloaded on conv_start"
+    assert fake_view.machine_states[-1] == f"Preloaded taskCode for order {order.order_id} - {order.recipe}"

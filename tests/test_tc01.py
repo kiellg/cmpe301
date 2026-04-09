@@ -69,7 +69,7 @@ def test_tc01_newly_saved_order_is_hint_for_next_dispatch_when_plc_not_ready(
     """Verify the controller prefers the newly saved pending order as the next hint."""
     model = manager_factory()
     model.add_order("PO-EXISTING", "All Holes", 1, "seed", priority=10)
-    plc = fake_plc_factory(connected=True, await_app=False)
+    plc = fake_plc_factory(connected=True, conv_start=False)
     controller = controller_factory(model, view=fake_view, plc=plc)
     controller.current_username = "operator1"
 

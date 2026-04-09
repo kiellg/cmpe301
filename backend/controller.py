@@ -4,6 +4,7 @@ import sys
 from datetime import datetime, timezone
 
 from model import MesManager, ProductionOrder
+from oee import IDEAL_CYCLE_TIME_SECONDS, calculate_oee
 from opcua_client import RECIPE_TASK_CODES, PlcClient, format_rfid_trace
 from view import MesView
 
@@ -142,8 +143,9 @@ class MesController:
 
         # Keep the newly saved order as the next dispatch candidate if the PLC
         # is not ready yet.  This avoids falling back to older seeded Pending
-        # orders when awaitApp eventually becomes True.
+        # orders when the next conv_start/awaitApp sequence arrives.
         self._dispatch_hint_order_id = order.id
+        self._maybe_preload_task_code(order)
         dispatched = self.dispatch_saved_order(order.id)
 
         self._refresh_orders()
@@ -153,7 +155,13 @@ class MesController:
         elif self._active_order is not None and self._active_order["db_id"] != order.id:
             message = f"Order {order.order_id} was saved and queued behind the active order."
         elif self.plc_client.is_connected:
-            message = f"Order {order.order_id} was saved and is waiting for the PLC ready signal."
+            if bool(self.plc_client.read_node("conv_start")):
+                message = (
+                    f"Order {order.order_id} was saved, taskCode was preloaded, "
+                    "and it is waiting for the PLC ready signal."
+                )
+            else:
+                message = f"Order {order.order_id} was saved and is waiting for a pallet at conv_start."
         else:
             message = f"Order {order.order_id} was saved and is waiting for the PLC connection."
         self.view.show_message("Order Submitted", message)
@@ -218,6 +226,24 @@ class MesController:
             and bool(self.plc_client.read_node("awaitApp"))
         ):
             self.dispatch_saved_order(order_db_id)
+
+    def handle_conv_start(self) -> None:
+        if self._active_order is not None:
+            self.view.append_plc_log(
+                f"conv_start fired while order {self._active_order['order_id']} is already active"
+            )
+            return
+
+        order = self._next_dispatchable_order()
+        if order is None:
+            self.view.update_machine_state("Idle - no pending orders")
+            self.view.append_plc_log("conv_start fired but no pending orders are ready")
+            return
+
+        if self._maybe_preload_task_code(order):
+            self.view.update_machine_state(
+                f"Preloaded taskCode for order {order.order_id} - {order.recipe}"
+            )
 
     def handle_await_app(self) -> None:
         if self._active_order is not None:
@@ -303,7 +329,10 @@ class MesController:
         self.view.append_plc_log("Connected to PLC")
 
         order = self._next_dispatchable_order()
-        if order is not None and bool(self.plc_client.read_node("awaitApp")):
+        if order is None:
+            return
+        self._maybe_preload_task_code(order)
+        if bool(self.plc_client.read_node("awaitApp")):
             self.dispatch_saved_order(order.id)
 
     def close_active_order(self) -> None:
@@ -390,6 +419,23 @@ class MesController:
         )
         self._refresh_orders()
 
+    def _maybe_preload_task_code(self, order: ProductionOrder) -> bool:
+        if not self.plc_client.is_connected:
+            return False
+        if not bool(self.plc_client.read_node("conv_start")):
+            return False
+        task_code = RECIPE_TASK_CODES.get(order.recipe, 0)
+        self.plc_client.write_node("taskCode", task_code)
+        self.model.update_order_traceability(
+            order.id,
+            last_result=f"Task code {task_code} preloaded on conv_start",
+        )
+        self._refresh_orders()
+        self.view.append_plc_log(
+            f"conv_start: preloaded taskCode={task_code} for order {order.order_id}"
+        )
+        return True
+
     def _next_dispatchable_order(self) -> ProductionOrder | None:
         if self._dispatch_hint_order_id is not None:
             hinted_order = self.model.get_order_by_id(self._dispatch_hint_order_id)
@@ -418,3 +464,44 @@ class MesController:
 
     def _refresh_orders(self) -> None:
         self.view.populate_orders(self.model.list_orders())
+        self._refresh_metrics()
+
+    def _refresh_metrics(self) -> None:
+        interval_bounds = self.model.get_process_data_interval_bounds()
+        if interval_bounds is None:
+            self.view.show_oee_unavailable("No process history logged yet.")
+            return
+
+        interval_start, interval_end = interval_bounds
+        records = self.model.list_process_data_for_interval(interval_start, interval_end)
+        metrics = calculate_oee(
+            records,
+            interval_start,
+            interval_end,
+            ideal_cycle_time_seconds=IDEAL_CYCLE_TIME_SECONDS,
+        )
+        self.view.update_oee(
+            metrics.availability,
+            metrics.performance,
+            metrics.quality,
+            detail_text=self._format_oee_detail(metrics),
+        )
+
+    @staticmethod
+    def _format_oee_detail(metrics) -> str:
+        quality_note = {
+            "unit_counts": "Quality from logged good/defect unit counts.",
+            "cycle_failure_approx": (
+                "Quality approximated from completed vs failed cycles because "
+                "failed drills do not yet log defect_count."
+            ),
+            "default_100": "Quality defaults to 100% until an explicit failed drill result is logged.",
+        }[metrics.quality_mode]
+        return (
+            f"Window: {metrics.interval_start} to {metrics.interval_end} | "
+            f"Completed cycles: {metrics.completed_cycles} | "
+            f"Operating/planned: {metrics.operating_time_s:.0f}s / {metrics.planned_production_time_s:.0f}s | "
+            f"Ideal cycle: {IDEAL_CYCLE_TIME_SECONDS:.0f}s | "
+            f"Availability uses summed actual_start/actual_end durations from persisted process_data. "
+            f"{quality_note}"
+        )

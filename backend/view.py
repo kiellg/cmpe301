@@ -306,7 +306,14 @@ class MesView(QObject):
         if self._plc_machine_state_label is not None:
             self._plc_machine_state_label.setText(machine_state_text)
 
-    def update_oee(self, availability: float, performance: float, quality: float) -> None:
+    def update_oee(
+        self,
+        availability: float,
+        performance: float,
+        quality: float,
+        *,
+        detail_text: str | None = None,
+    ) -> None:
         oee = availability * performance * quality
         self.main_window.oee_label.setText(
             f"OEE: {oee:.1%}  |  "
@@ -314,6 +321,12 @@ class MesView(QObject):
             f"P: {performance:.1%}  "
             f"Q: {quality:.1%}"
         )
+        if detail_text:
+            self.main_window.monitoring_label.setText(detail_text)
+
+    def show_oee_unavailable(self, message: str) -> None:
+        self.main_window.oee_label.setText(f"OEE: -- ({message})")
+        self.main_window.monitoring_label.setText(message)
 
     def update_node_monitor(self, alias: str, value: object) -> None:
         if alias in self._node_rows and self._node_table is not None:
@@ -430,6 +443,7 @@ class MesView(QObject):
         self._build_plc_diagnostics_tab()
         self.update_machine_state("Not connected")
         self.update_plc_status(False)
+        self.show_oee_unavailable("OEE will appear after process history is logged.")
 
     def _build_plc_diagnostics_tab(self) -> None:
         plc_tab = QWidget(self.main_window)
@@ -455,6 +469,7 @@ class MesView(QObject):
         rows = [
             ("appRun", "DB1"),
             ("appDone", "DB1"),
+            ("conv_start", "Default"),
             ("awaitApp", "DB1"),
             ("drillDone", "DB1"),
             ("taskCode", "DB1"),

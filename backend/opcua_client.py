@@ -57,6 +57,7 @@ BACKOFF_MAX_S  = 30.0
 # ---------------------------------------------------------------------------
 
 NODE_PATHS: dict[str, str] = {
+    "conv_start": '"conv_start"',
     # abstractMachine [DB1] — GRAPH sequence control
     "taskCode":   '"abstractMachine"."taskCode"',   # Byte  — TCP byte 0 to Festo CECC
     "awaitApp":   '"abstractMachine"."awaitApp"',   # Bool  — PLC waiting for MES command
@@ -84,6 +85,7 @@ NODE_PATHS: dict[str, str] = {
 # until periodic reads are added there.
 SUBSCRIBED_ALIASES: frozenset[str] = frozenset({
     "appDone",
+    "conv_start",
     "awaitApp",
     "readDone",
     "readPresence",
@@ -173,7 +175,7 @@ class OpcUaSubscriptionHandler:
     emit Qt signals.  Qt signals are thread-safe, so emitting them from the
     subscription thread is correct.
 
-    Subscribed nodes: appDone, awaitApp, readDone, readPresence.
+    Subscribed nodes: appDone, conv_start, awaitApp, readDone, readPresence.
     """
 
     def __init__(self, plc_client: "PlcClient") -> None:
@@ -200,6 +202,9 @@ class OpcUaSubscriptionHandler:
             if alias == "appDone" and bool(val):
                 # PLC finished drilling cycle → reset PLC flag, notify controller
                 self._plc._on_app_done()
+
+            elif alias == "conv_start" and bool(val):
+                self._plc.conv_start.emit()
 
             elif alias == "awaitApp" and bool(val):
                 # PLC stepped into the "await MES command" GRAPH state
@@ -237,6 +242,7 @@ class PlcClient(QThread):
     disconnected     Emitted when the connection is lost or stop_client() called.
     rfid_tag_read    Emitted with parsed RFID payload when readDone fires.
     app_done         Emitted after the drilling cycle completes (appDone → True).
+    conv_start       Emitted when the PLC raises the conveyor/start dispatch trigger.
     await_app        Emitted when the PLC enters the "await MES" GRAPH state.
     data_changed     Emitted for every subscribed node value change (node alias, value).
     error            Emitted with a human-readable message on any fault.
@@ -256,6 +262,7 @@ class PlcClient(QThread):
     disconnected:  pyqtSignal = pyqtSignal()
     rfid_tag_read: pyqtSignal = pyqtSignal(dict)    # {"order_id": int, "task_code": int, "quantity": int}
     app_done:      pyqtSignal = pyqtSignal()
+    conv_start:    pyqtSignal = pyqtSignal()
     await_app:     pyqtSignal = pyqtSignal()
     data_changed:  pyqtSignal = pyqtSignal(str, object)  # (node_alias, new_value)
     error:         pyqtSignal = pyqtSignal(str)
@@ -536,7 +543,7 @@ class PlcClient(QThread):
         100 ms background loop.  Runs after a successful _connect().
 
         The OPC UA subscription is the only active notification path for
-        appDone, awaitApp, readDone, and readPresence in the current code.
+        appDone, conv_start, awaitApp, readDone, and readPresence in the current code.
         This loop is intentionally idle until periodic reads are added here.
 
         Additional periodic reads (for example drillDone or machine mode

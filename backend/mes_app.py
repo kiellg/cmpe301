@@ -31,6 +31,7 @@ def create_app(
     # delivers to the GUI thread, so no explicit locking is needed here.
     plc_client.rfid_tag_read.connect(controller.handle_rfid_tag_read)
     plc_client.app_done.connect(controller.handle_app_done)
+    plc_client.conv_start.connect(controller.handle_conv_start)
     plc_client.await_app.connect(controller.handle_await_app)
     plc_client.error.connect(controller.handle_plc_error)
     plc_client.connected.connect(controller.handle_plc_connected)
